@@ -8,20 +8,16 @@
 //! 3. Send an Initiate Multitransport Response PDU (S_OK or E_ABORT)
 //!    back on the TCP connection
 //!
-//! `MultitransportBootstrap` orchestrates this sequence. The upstream
-//! `ironrdp-connector` doesn't implement multitransport yet, so this
-//! acts as a standalone shim that an application wires into its
-//! connection flow.
+//! `ironrdp-connector` surfaces each request and frames the matching response.
+//! `MultitransportBootstrap` owns the sideband connection attempt between those connector steps.
 
 use core::net::SocketAddr;
-use std::sync::Arc;
-
 use ironrdp_pdu::rdp::multitransport::{MultitransportRequestPdu, MultitransportResponsePdu, RequestedProtocol};
 use ironrdp_rdpemt::{RdpemtError, RdpemtErrorExt as _, TunnelConfig};
 use ironrdp_rdpeudp::ConnectionConfig;
 
 use crate::error::{UdpTransportError, UdpTransportErrorExt as _};
-use crate::transport::{UdpTransport, UdpTransportConfig, connect_udp};
+use crate::transport::{UdpTlsConfig, UdpTransport, UdpTransportConfig, connect_udp};
 
 /// Orchestrates the multitransport connection sequence.
 ///
@@ -88,12 +84,7 @@ impl MultitransportBootstrap {
     /// On success, stores the transport and prepares an `S_OK` response.
     /// On failure, prepares an `E_ABORT` response and returns the error.
     ///
-    /// `server_cert_verifier` is forwarded to the underlying [`connect_udp`]
-    /// call the same way `connection_config` is: `None` preserves the
-    /// historic no-verification behavior, `Some(verifier)` opts into real
-    /// TLS certificate validation. Without threading it through here, a
-    /// caller going through this orchestrator had no way to reach the
-    /// verification `connect_udp` itself already supports.
+    /// `tls_config` is forwarded to [`connect_udp`] so the sideband uses the same certificate policy and callback as the primary transport.
     ///
     /// After calling this, use [`response_pdu()`] to get the bytes to
     /// send back to the server on the TCP connection.
@@ -104,7 +95,7 @@ impl MultitransportBootstrap {
         server_addr: SocketAddr,
         server_name: String,
         connection_config: ConnectionConfig,
-        server_cert_verifier: Option<Arc<dyn tokio_rustls::rustls::client::danger::ServerCertVerifier>>,
+        tls_config: UdpTlsConfig,
     ) -> Result<(), UdpTransportError> {
         // This driver only implements the reliable transport (RDPEUDP2 + TLS).
         // UdpFecL (lossy RDPEUDP + DTLS) is a distinct wire protocol this crate
@@ -125,7 +116,7 @@ impl MultitransportBootstrap {
         };
         let mut config = UdpTransportConfig::new(server_addr, server_name, tunnel_config);
         config.connection_config = connection_config;
-        config.server_cert_verifier = server_cert_verifier;
+        config.tls = tls_config;
 
         match connect_udp(config).await {
             Ok(transport) => {
@@ -238,7 +229,12 @@ mod tests {
         let unreachable_addr: SocketAddr = "127.0.0.1:1".parse().expect("valid loopback address");
 
         let result = bootstrap
-            .connect(unreachable_addr, "localhost".into(), ConnectionConfig::default(), None)
+            .connect(
+                unreachable_addr,
+                "localhost".into(),
+                ConnectionConfig::default(),
+                UdpTlsConfig::new(unreachable_addr.to_string()),
+            )
             .await;
 
         // Checking the specific error kind (not just is_err()) is the point:
