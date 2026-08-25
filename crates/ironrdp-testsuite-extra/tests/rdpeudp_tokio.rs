@@ -7,9 +7,9 @@
 //! Most tests use a multithreaded runtime.
 //! A dedicated test also covers the current-thread runtime used by ActiveX workers.
 
+use core::sync::atomic::{AtomicUsize, Ordering};
 use core::time::Duration;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use ironrdp_rdpemt::TunnelConfig;
 use ironrdp_rdpeudp::ConnectionConfig;
@@ -100,6 +100,55 @@ async fn full_stack_current_thread_runtime() {
     let (client, mut server) = establish_loopback_pair_on("127.0.0.1:0").await;
     client.send(vec![0x01, 0x02, 0x03]).await.expect("client send");
     assert_eq!(server.recv().await.expect("server recv"), vec![0x01, 0x02, 0x03]);
+    client.shutdown().await.expect("client shutdown");
+    server.shutdown().await.expect("server shutdown");
+}
+
+/// Verify a blocking certificate prompt cannot starve RDPEUDP timers on the ActiveX runtime.
+#[tokio::test(flavor = "current_thread")]
+async fn delayed_certificate_callback_does_not_starve_udp_driver() {
+    let server_sock = UdpSocket::bind("127.0.0.1:0").await.expect("bind server");
+    let server_addr = server_sock.local_addr().expect("server addr");
+    let tunnel_config = test_tunnel_config();
+    let connection_config = ConnectionConfig {
+        idle_timeout: Duration::from_millis(100),
+        keep_alive_interval: Duration::from_millis(20),
+        ..ConnectionConfig::default()
+    };
+
+    let server_handle = tokio::spawn({
+        let tunnel_config = tunnel_config.clone();
+        let connection_config = connection_config.clone();
+        async move {
+            accept_udp(
+                server_sock,
+                UdpAcceptConfig {
+                    tls_config: test_tls_server_config(),
+                    tunnel_config,
+                    connection_config,
+                    accept_timeout: Duration::from_secs(10),
+                },
+            )
+            .await
+        }
+    });
+
+    let client_handle = tokio::spawn(async move {
+        let mut config = UdpTransportConfig::new(server_addr, "localhost".into(), tunnel_config);
+        config.connection_config = connection_config;
+        config.tls.certificate_validation = CertificateValidation::Strict;
+        config.tls.certificate_validation_callback = Some(Arc::new(|_, _, _| {
+            std::thread::sleep(Duration::from_millis(250));
+            true
+        }));
+        connect_udp(config).await
+    });
+
+    let (server, client) = tokio::join!(server_handle, client_handle);
+    let mut server = server.expect("server join").expect("server transport");
+    let client = client.expect("client join").expect("client transport");
+    client.send(vec![0x01]).await.expect("send after delayed callback");
+    assert_eq!(server.recv().await.expect("receive after delayed callback"), vec![0x01]);
     client.shutdown().await.expect("client shutdown");
     server.shutdown().await.expect("server shutdown");
 }

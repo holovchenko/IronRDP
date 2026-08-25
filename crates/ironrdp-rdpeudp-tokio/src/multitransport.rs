@@ -36,8 +36,9 @@ use crate::transport::{UdpTlsConfig, UdpTransport, UdpTransportConfig, connect_u
 /// let mut bootstrap = MultitransportBootstrap::new(request);
 ///
 /// // Attempt the UDP connection
+/// let tls = UdpTlsConfig::new(server_addr.to_string());
 /// let _ = bootstrap
-///     .connect(server_addr, "server.example.com".into(), Default::default(), None)
+///     .connect(server_addr, "server.example.com".into(), Default::default(), tls)
 ///     .await;
 ///
 /// // Always send the response back on TCP (S_OK or E_ABORT)

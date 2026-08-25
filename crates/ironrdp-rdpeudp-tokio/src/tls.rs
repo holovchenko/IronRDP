@@ -21,10 +21,50 @@ pub(crate) type ServerTlsStream<S> = tokio_rustls::server::TlsStream<S>;
 ///
 /// The policy, callback, and endpoint use the same semantics as `ironrdp-tls` on the primary TCP transport.
 ///
-/// Returns the encrypted stream. The driver task continues running
-/// in the background, transparently shuttling encrypted bytes between
-/// the UDP socket and this TLS stream via `SharedIo`.
+/// A synchronous validation callback runs on a dedicated blocking thread so it cannot starve the RDPEUDP driver on a current-thread runtime.
+///
+/// Returns the encrypted stream.
+/// The driver task continues running in the background, transparently shuttling encrypted bytes between the UDP socket and this TLS stream via `SharedIo`.
 pub(crate) async fn tls_upgrade<S>(
+    stream: S,
+    server_name: &str,
+    certificate_validation: CertificateValidation,
+    certificate_validation_callback: Option<CertificateValidationCallback>,
+    certificate_validation_endpoint: &str,
+) -> io::Result<TlsStream<S>>
+where
+    S: Unpin + Send + AsyncRead + AsyncWrite + 'static,
+{
+    if certificate_validation_callback.is_none() {
+        return tls_upgrade_inner(
+            stream,
+            server_name,
+            certificate_validation,
+            None,
+            certificate_validation_endpoint,
+        )
+        .await;
+    }
+
+    let server_name = server_name.to_owned();
+    let certificate_validation_endpoint = certificate_validation_endpoint.to_owned();
+    tokio::task::spawn_blocking(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(tls_upgrade_inner(
+                stream,
+                &server_name,
+                certificate_validation,
+                certificate_validation_callback,
+                &certificate_validation_endpoint,
+            ))
+    })
+    .await
+    .map_err(io::Error::other)?
+}
+
+async fn tls_upgrade_inner<S>(
     stream: S,
     server_name: &str,
     certificate_validation: CertificateValidation,
