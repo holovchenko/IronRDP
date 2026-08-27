@@ -640,7 +640,7 @@ mod tests {
             guard.read_waker = Some(futures_waker(Arc::clone(&woken)));
         }
 
-        let driver = Driver::new(socket, conn, Arc::clone(&shared), Arc::new(Notify::new()));
+        let mut driver = Driver::new(socket, conn, Arc::clone(&shared), Arc::new(Notify::new()));
         driver.release_stream(Some(&DriverError::connection_closed("test")));
 
         assert!(
@@ -648,6 +648,29 @@ mod tests {
             "the reader was left parked"
         );
 
+        let guard = shared.lock().expect("lock");
+        assert!(guard.closed);
+        assert_eq!(guard.error, Some(io::ErrorKind::ConnectionAborted));
+    }
+
+    #[tokio::test]
+    async fn dropping_driver_wakes_a_parked_reader() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.expect("bind");
+        let conn = RdpeudpConnection::connect(test_connection_config(), Clock::new().now()).expect("connect");
+        let shared = Arc::new(Mutex::new(SharedIo::new()));
+        let woken = Arc::new(core::sync::atomic::AtomicBool::new(false));
+
+        {
+            let mut guard = shared.lock().expect("lock");
+            guard.read_waker = Some(futures_waker(Arc::clone(&woken)));
+        }
+
+        drop(Driver::new(socket, conn, Arc::clone(&shared), Arc::new(Notify::new())));
+
+        assert!(
+            woken.load(core::sync::atomic::Ordering::SeqCst),
+            "the reader was left parked"
+        );
         let guard = shared.lock().expect("lock");
         assert!(guard.closed);
         assert_eq!(guard.error, Some(io::ErrorKind::ConnectionAborted));
