@@ -112,6 +112,21 @@ pub enum MultitransportResult {
     Failure(u32),
 }
 
+impl MultitransportResult {
+    /// Returns whether this outcome requires an Initiate Multitransport Response.
+    pub const fn response_required(&self, soft_sync: bool) -> bool {
+        soft_sync || matches!(self, Self::Failure(_))
+    }
+
+    /// Builds the response PDU for this outcome and the server's request ID.
+    pub fn response_pdu(&self, request_id: u32) -> rdp::multitransport::MultitransportResponsePdu {
+        match self {
+            Self::Success => rdp::multitransport::MultitransportResponsePdu::success(request_id),
+            Self::Failure(hr) => multitransport_response(request_id, *hr),
+        }
+    }
+}
+
 /// Why a runtime-defined static virtual channel could not be registered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DynamicStaticChannelAttachError {
@@ -722,27 +737,26 @@ impl ClientConnector {
             return Ok(None);
         };
 
-        match (*soft_sync, result) {
+        if !result.response_required(*soft_sync) {
+            return Ok(None);
+        }
+
+        match *soft_sync {
             // Soft-Sync obliges a response either way, and presupposes the
             // message channel. Falling back to the I/O channel would put the
             // response somewhere the server is not reading, so its absence is an
             // error rather than a reason to improvise.
-            (true, _) => message_channel_id
+            true => message_channel_id
                 .ok_or_else(|| {
                     general_err!("Soft-Sync was negotiated but the server never offered an MCS message channel")
                 })
                 .map(Some),
-            // `S_OK` is the one value 2.2.15.2 forbids here, so success and only
-            // success is withheld. The outcome is still consumed and the
-            // handshake proceeds, so a caller that established the transport does
-            // not have to know which mode is in play.
-            (false, MultitransportResult::Success) => Ok(None),
             // A failure is still reported: 3.2.5.15.1 asks for it whenever the
             // client could not initiate the channel, with no Soft-Sync condition.
             // It is a SHOULD, so a missing message channel means staying silent
             // rather than failing a connection over an optional report. In
             // practice one exists, since 2.2.15.1 puts the request on it.
-            (false, MultitransportResult::Failure(_)) => Ok(*message_channel_id),
+            false => Ok(*message_channel_id),
         }
     }
 
@@ -787,10 +801,7 @@ impl ClientConnector {
         // Soft-Sync. Either way the outcome is consumed and the handshake
         // proceeds.
         let total_written = if let Some(response_channel) = response_channel {
-            let response = match result {
-                MultitransportResult::Success => rdp::multitransport::MultitransportResponsePdu::success(request_id),
-                MultitransportResult::Failure(hr) => multitransport_response(request_id, hr),
-            };
+            let response = result.response_pdu(request_id);
 
             encode_send_data_request(user_channel_id, response_channel, &response, output)?
         } else {
