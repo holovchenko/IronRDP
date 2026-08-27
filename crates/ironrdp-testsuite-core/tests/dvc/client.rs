@@ -1,7 +1,11 @@
 use ironrdp_core::{encode_vec, impl_as_any};
 use ironrdp_dvc::ironrdp_pdu::{PduResult, pdu_other_err};
-use ironrdp_dvc::pdu::{DataPdu, DrdynvcDataPdu, DrdynvcServerPdu};
-use ironrdp_dvc::{DrdynvcClient, DvcClientProcessor, DvcMessage, DvcProcessor};
+use ironrdp_dvc::pdu::{
+    DataPdu, DrdynvcClientPdu, DrdynvcDataPdu, DrdynvcServerPdu, SoftSyncChannelList, SoftSyncRequestPdu,
+    SoftSyncTunnelType,
+};
+use ironrdp_dvc::{DrdynvcClient, DvcClientProcessor, DvcMessage, DvcMessageBatch, DvcProcessor};
+use ironrdp_svc::SvcMessage;
 use ironrdp_svc::SvcProcessor as _;
 
 #[derive(Default)]
@@ -105,4 +109,40 @@ fn failed_established_dynamic_channel_attachment_is_not_registered() {
             .attach_established_dynamic_channel(7, RecordedDvc::default())
             .is_ok()
     );
+}
+
+#[test]
+fn soft_sync_omits_a_tunnel_that_closed_before_migration() {
+    let mut client = DrdynvcClient::new();
+    client
+        .attach_established_dynamic_channel(7, RecordedDvc::default())
+        .expect("recorded channel should attach");
+    client.enable_soft_sync_tunnel(SoftSyncTunnelType::RELIABLE_UDP);
+    client.disable_soft_sync_tunnel(SoftSyncTunnelType::RELIABLE_UDP);
+
+    let request = encode_vec(&DrdynvcServerPdu::SoftSyncRequest(SoftSyncRequestPdu::new(vec![
+        SoftSyncChannelList::new(SoftSyncTunnelType::RELIABLE_UDP, vec![7]),
+    ])))
+    .expect("Soft-Sync request should encode");
+
+    assert_eq!(
+        client
+            .process(&request)
+            .expect("Soft-Sync request should be answered")
+            .len(),
+        1
+    );
+    assert!(client.soft_sync_complete());
+    assert_eq!(client.tunnel_for_channel(7), None);
+    assert!(!client.has_channels_on_tunnel(SoftSyncTunnelType::RELIABLE_UDP));
+}
+
+#[test]
+fn message_batch_rejects_a_mismatched_channel_id() {
+    let message = SvcMessage::from(DrdynvcClientPdu::Data(DrdynvcDataPdu::Data(DataPdu::new(
+        7,
+        Vec::new(),
+    ))));
+
+    assert!(DvcMessageBatch::try_new(8, vec![message]).is_err());
 }

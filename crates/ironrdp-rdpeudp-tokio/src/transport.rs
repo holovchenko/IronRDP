@@ -56,6 +56,12 @@ pub struct UdpTransportConfig {
     /// Maximum time to wait for the RDPEUDP2 handshake to complete.
     /// Default: 10 seconds (matching FreeRDP).
     pub handshake_timeout: Duration,
+    /// Maximum time to wait for the TLS handshake to complete.
+    /// Default: 60 seconds to allow an interactive certificate decision.
+    pub tls_timeout: Duration,
+    /// Maximum time to wait for the RDPEMT tunnel handshake to complete.
+    /// Default: 10 seconds.
+    pub tunnel_timeout: Duration,
     /// TLS certificate-validation settings for the sideband connection.
     pub tls: UdpTlsConfig,
 }
@@ -70,6 +76,8 @@ impl UdpTransportConfig {
             tunnel_config,
             connection_config: ConnectionConfig::default(),
             handshake_timeout: Duration::from_secs(10),
+            tls_timeout: Duration::from_secs(60),
+            tunnel_timeout: Duration::from_secs(10),
             tls: UdpTlsConfig::new(server_addr.to_string()),
         }
     }
@@ -83,6 +91,8 @@ impl core::fmt::Debug for UdpTransportConfig {
             .field("tunnel_config", &self.tunnel_config)
             .field("connection_config", &self.connection_config)
             .field("handshake_timeout", &self.handshake_timeout)
+            .field("tls_timeout", &self.tls_timeout)
+            .field("tunnel_timeout", &self.tunnel_timeout)
             .field("tls", &self.tls)
             .finish()
     }
@@ -440,14 +450,18 @@ pub async fn connect_udp(config: UdpTransportConfig) -> Result<UdpTransport, Udp
 
     // Phase 3: TLS handshake over the RDPEUDP2 stream
     let rdpeudp_stream = RdpeudpStream::new(Arc::clone(&shared));
-    let tls_stream = tls_upgrade(
-        rdpeudp_stream,
-        &config.server_name,
-        config.tls.certificate_validation,
-        config.tls.certificate_validation_callback,
-        &config.tls.certificate_validation_endpoint,
+    let tls_stream = tokio::time::timeout(
+        config.tls_timeout,
+        tls_upgrade(
+            rdpeudp_stream,
+            &config.server_name,
+            config.tls.certificate_validation,
+            config.tls.certificate_validation_callback,
+            &config.tls.certificate_validation_endpoint,
+        ),
     )
     .await
+    .map_err(|_| UdpTransportError::tls_timeout("connect udp"))?
     .map_err(|error| UdpTransportError::tls("connect udp", error))?;
 
     tracing::debug!("TLS handshake complete, starting RDPEMT tunnel negotiation");
@@ -458,7 +472,12 @@ pub async fn connect_udp(config: UdpTransportConfig) -> Result<UdpTransport, Udp
     // tokio::io::split gives us independent read/write halves.
     let (mut tls_read, mut tls_write) = tokio::io::split(tls_stream);
 
-    let mut tunnel = establish_tunnel_split(&mut tls_read, &mut tls_write, config.tunnel_config).await?;
+    let mut tunnel = tokio::time::timeout(
+        config.tunnel_timeout,
+        establish_tunnel_split(&mut tls_read, &mut tls_write, config.tunnel_config),
+    )
+    .await
+    .map_err(|_| UdpTransportError::tunnel_timeout("connect udp"))??;
 
     tracing::debug!("RDPEMT tunnel established, starting data pump");
 

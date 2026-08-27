@@ -5,8 +5,8 @@
 //!
 //! 1. Parse the request (requestId + requestedProtocol + securityCookie)
 //! 2. Establish a UDP transport using `connect_udp()`
-//! 3. Send an Initiate Multitransport Response PDU (S_OK or E_ABORT)
-//!    back on the TCP connection
+//! 3. Send an Initiate Multitransport Response PDU back on the TCP connection
+//!    when the negotiated mode or connection outcome requires one
 //!
 //! `ironrdp-connector` surfaces each request and frames the matching response.
 //! `MultitransportBootstrap` owns the sideband connection attempt between those connector steps.
@@ -24,7 +24,8 @@ use crate::transport::{UdpTlsConfig, UdpTransport, UdpTransportConfig, connect_u
 /// Created from the raw Initiate Multitransport Request PDU payload
 /// received on the TCP MCS message channel. Call [`connect()`] to
 /// establish the UDP transport, then [`response_pdu()`] to get the
-/// bytes to send back on TCP.
+/// response selected by that attempt.
+/// The caller decides whether the negotiated mode requires sending it.
 ///
 /// [`connect()`]: MultitransportBootstrap::connect
 /// [`response_pdu()`]: MultitransportBootstrap::response_pdu
@@ -41,9 +42,11 @@ use crate::transport::{UdpTlsConfig, UdpTransport, UdpTransportConfig, connect_u
 ///     .connect(server_addr, "server.example.com".into(), Default::default(), tls)
 ///     .await;
 ///
-/// // Always send the response back on TCP (S_OK or E_ABORT)
+/// // Send E_ABORT after failure, or S_OK when Soft-Sync was negotiated.
 /// let response_bytes = bootstrap.response_pdu().expect("response available after connect");
-/// tcp_writer.write_all(&response_bytes).await?;
+/// if !bootstrap.is_connected() || soft_sync_negotiated {
+///     tcp_writer.write_all(&response_bytes).await?;
+/// }
 ///
 /// // If successful, use the transport
 /// if let Some(transport) = bootstrap.take_transport() {

@@ -127,6 +127,8 @@ pub struct ConnectionResult {
     pub user_channel_id: u16,
     /// MCS channel ID of the message channel, when one was negotiated.
     pub message_channel_id: Option<u16>,
+    /// Whether both peers advertised Soft-Sync support for multitransport.
+    pub multitransport_soft_sync: bool,
     pub share_id: u32,
     pub static_channels: StaticChannelSet,
     pub desktop_size: DesktopSize,
@@ -642,6 +644,16 @@ impl ClientConnector {
     pub fn multitransport_request(&self) -> Option<&rdp::multitransport::MultitransportRequestPdu> {
         match &self.state {
             ClientConnectorState::MultitransportPending { request, .. } => Some(request),
+            _ => None,
+        }
+    }
+
+    /// Returns whether both peers advertised Soft-Sync for the pending request.
+    ///
+    /// `None` means no multitransport request is pending.
+    pub fn multitransport_soft_sync_negotiated(&self) -> Option<bool> {
+        match &self.state {
+            ClientConnectorState::MultitransportPending { soft_sync, .. } => Some(*soft_sync),
             _ => None,
         }
     }
@@ -1542,6 +1554,7 @@ impl Sequence for ClientConnector {
                                     io_channel_id: connection_activation.io_channel_id(),
                                     user_channel_id: connection_activation.user_channel_id(),
                                     message_channel_id: self.message_channel_id,
+                                    multitransport_soft_sync: self.soft_sync_negotiated(),
                                     share_id,
                                     static_channels,
                                     desktop_size,

@@ -6,7 +6,7 @@ use ironrdp_pdu::mcs::{DisconnectProviderUltimatum, DisconnectReason, McsMessage
 use ironrdp_pdu::rdp::autodetect::{AutoDetectReqPdu, AutoDetectRequest, AutoDetectResponse, AutoDetectRspPdu};
 use ironrdp_pdu::rdp::client_info::CompressionType;
 use ironrdp_pdu::rdp::headers::{CompressionFlags, ShareDataCtx, ShareDataPdu};
-use ironrdp_pdu::rdp::multitransport::MultitransportRequestPdu;
+use ironrdp_pdu::rdp::multitransport::{MultitransportRequestPdu, MultitransportResponsePdu};
 use ironrdp_pdu::rdp::server_error_info::{ErrorInfo, ProtocolIndependentCode, ServerSetErrorInfoPdu};
 use ironrdp_pdu::rdp::session_info::{InfoData, SaveSessionInfoPdu, ServerAutoReconnect};
 use ironrdp_pdu::x224::X224;
@@ -37,7 +37,7 @@ pub enum ProcessorOutput {
     SaveSessionInfo { logon_complete: bool },
     /// Server Initiate Multitransport Request. The application should establish a
     /// sideband UDP transport using the request ID and security cookie, then send
-    /// a [`MultitransportResponsePdu`] back on the IO channel.
+    /// a [`MultitransportResponsePdu`] back on the message channel.
     ///
     /// See [\[MS-RDPBCGR\] 2.2.15.1].
     ///
@@ -256,13 +256,10 @@ impl Processor {
 
         match io_channel {
             ironrdp_pdu::rdp::headers::IoChannelPdu::Data(ctx) => Self::process_share_data(ctx, bulk_decompressor),
-            ironrdp_pdu::rdp::headers::IoChannelPdu::MultitransportRequest(pdu) => {
-                debug!(
-                    "Received Initiate Multitransport Request: request_id={}",
-                    pdu.request_id
-                );
-                Ok(vec![ProcessorOutput::MultitransportRequest(pdu)])
-            }
+            ironrdp_pdu::rdp::headers::IoChannelPdu::MultitransportRequest(_) => Err(reason_err!(
+                "X224",
+                "multitransport request received outside the MCS message channel"
+            )),
             ironrdp_pdu::rdp::headers::IoChannelPdu::DeactivateAll(_) => Ok(vec![ProcessorOutput::DeactivateAll]),
         }
     }
@@ -405,6 +402,14 @@ impl Processor {
             return Err(reason_err!("message channel", "no message channel negotiated"));
         };
 
+        if let Ok(request) = decode::<MultitransportRequestPdu>(data_ctx.user_data) {
+            debug!(
+                request_id = request.request_id,
+                "Received Initiate Multitransport Request"
+            );
+            return Ok(vec![ProcessorOutput::MultitransportRequest(request)]);
+        }
+
         let req = decode::<AutoDetectReqPdu>(data_ctx.user_data).map_err(SessionError::decode)?;
 
         match req.request {
@@ -430,6 +435,17 @@ impl Processor {
                 Ok(Vec::new())
             }
         }
+    }
+
+    /// Encodes an Initiate Multitransport Response on the MCS message channel.
+    pub fn encode_multitransport_response(&self, response: &MultitransportResponsePdu) -> SessionResult<Vec<u8>> {
+        let message_channel_id = self
+            .message_channel_id
+            .ok_or_else(|| SessionError::general("no message channel negotiated"))?;
+        let mut frame = WriteBuf::new();
+        ironrdp_pdu::mcs::encode_send_data_request(self.user_channel_id, message_channel_id, response, &mut frame)
+            .map_err(SessionError::encode)?;
+        Ok(frame.into_inner())
     }
 
     /// Send a pdu on the static global channel. Typically used to send input events
@@ -475,7 +491,8 @@ mod tests {
     use ironrdp_core::encode_vec;
     use ironrdp_pdu::gcc::MonitorFlags;
     use ironrdp_pdu::rdp::finalization_messages::MonitorLayoutPdu;
-    use ironrdp_pdu::rdp::headers::ShareDataPduType;
+    use ironrdp_pdu::rdp::headers::{BasicSecurityHeader, BasicSecurityHeaderFlags, ShareDataPduType};
+    use ironrdp_pdu::rdp::multitransport::RequestedProtocol;
     use ironrdp_pdu::rdp::session_info::{InfoType, LogonExFlags, LogonInfoExtended};
 
     use super::*;
@@ -517,6 +534,33 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn processor_surfaces_multitransport_request_on_message_channel() {
+        let request = MultitransportRequestPdu {
+            security_header: BasicSecurityHeader {
+                flags: BasicSecurityHeaderFlags::TRANSPORT_REQ,
+            },
+            request_id: 42,
+            requested_protocol: RequestedProtocol::UdpFecR,
+            security_cookie: [0xAB; 16],
+        };
+        let encoded = encode_vec(&request).expect("encode multitransport request");
+        let processor = Processor::new(StaticChannelSet::new(), 1002, 1003, Some(1004), 0);
+
+        let outputs = processor
+            .process_message_channel(SendDataIndicationCtx {
+                initiator_id: 1002,
+                channel_id: 1004,
+                user_data: &encoded,
+            })
+            .expect("surface multitransport request");
+
+        assert!(matches!(
+            outputs.as_slice(),
+            [ProcessorOutput::MultitransportRequest(decoded)] if decoded == &request
+        ));
     }
 
     #[test]
