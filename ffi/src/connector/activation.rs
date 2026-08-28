@@ -63,9 +63,9 @@ pub mod ffi {
                 ironrdp::connector::connection_activation::ConnectionActivationState::Consumed => {
                     ConnectionActivationStateType::Consumed
                 }
-                ironrdp::connector::connection_activation::ConnectionActivationState::CapabilitiesExchange => {
-                    ConnectionActivationStateType::CapabilitiesExchange
-                }
+                ironrdp::connector::connection_activation::ConnectionActivationState::CapabilitiesExchange {
+                    ..
+                } => ConnectionActivationStateType::CapabilitiesExchange,
                 ironrdp::connector::connection_activation::ConnectionActivationState::ConnectionFinalization {
                     ..
                 } => ConnectionActivationStateType::ConnectionFinalization,

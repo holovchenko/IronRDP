@@ -1452,8 +1452,12 @@ impl Sequence for ClientConnector {
                 } else if ctx.channel_id == io_channel_id {
                     // Demand Active: bootstrapping is over, hand off to capabilities
                     // exchange with the PDU intact.
-                    let mut connection_activation =
-                        ConnectionActivationSequence::new(self.config.clone(), io_channel_id, user_channel_id);
+                    let mut connection_activation = ConnectionActivationSequence::new(
+                        self.config.clone(),
+                        io_channel_id,
+                        user_channel_id,
+                        message_channel_id,
+                    );
                     let written = connection_activation.step(input, received_at, output)?;
 
                     (
@@ -1501,7 +1505,7 @@ impl Sequence for ClientConnector {
                     // Server Deactivate All PDU before the Server Demand Active PDU (sent
                     // by e.g. Windows Server and gnome-remote-desktop); mirror it here and
                     // wait for the next input.
-                    ConnectionActivationState::CapabilitiesExchange => (
+                    ConnectionActivationState::CapabilitiesExchange { .. } => (
                         written,
                         ClientConnectorState::CapabilitiesExchange { connection_activation },
                     ),
@@ -1556,6 +1560,7 @@ impl Sequence for ClientConnector {
                                         self.config.clone(),
                                         connection_activation.io_channel_id(),
                                         connection_activation.user_channel_id(),
+                                        self.message_channel_id,
                                     ),
                                     compression_type: self.config.compression_type,
                                 },
