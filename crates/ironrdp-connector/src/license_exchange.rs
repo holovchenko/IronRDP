@@ -8,12 +8,73 @@ use ironrdp_core::WriteBuf;
 use ironrdp_pdu::PduHint;
 use ironrdp_pdu::rdp::server_license::{self, LicenseInformation, LicensePdu, ServerLicenseError};
 use rand::RngCore as _;
-use tracing::{debug, error, info, trace};
+use tracing::{debug, error, info, trace, warn};
 
 use super::{ConnectorError, ConnectorErrorExt as _, custom_err, general_err};
 use crate::{
     ConnectorResult, ConnectorResultExt as _, MonotonicInstant, Sequence, State, Written, encode_send_data_request,
 };
+
+// TESSERA PATCH (vendored fork — see rdp/ironrdp-fork.md for the full story).
+//
+// A Windows RDS host here interleaves an Auto-Detect Request (an RTT measure)
+// into the licensing exchange. Upstream feeds whatever arrives straight into
+// `LicensePdu::decode`, which rejects it on `securityHeaderFlags` and kills the
+// entire connection with a bare "decode error". mstsc talks to that same host
+// without complaint.
+//
+// The observed payload was `[0, 16, 0, 0, 6, 0, 0, 0, 20, 0]`: flags `0x1000`
+// (SEC_AUTODETECT_REQ, not SEC_LICENSE_PKT), headerLength 6, headerTypeId 0,
+// sequenceNumber 0, requestType `0x0014` (RDP_RTT_REQUEST).
+//
+// So: check the security header before decoding, and skip anything that is not
+// a licensing packet WITHOUT leaving the current state — the real licensing PDU
+// is still to come, and treating the intruder as the answer would strand the
+// exchange half-finished. Not answering the RTT probe is allowed; auto-detect
+// is advisory and the server proceeds regardless.
+
+/// `SEC_LICENSE_PKT` in `BasicSecurityHeader.flags` (MS-RDPBCGR 2.2.8.1.1.2.1).
+const SEC_LICENSE_PKT: u16 = 0x0080;
+
+/// Whether this MCS user data is a licensing packet at all, judged by the
+/// first LE `u16` of its `BasicSecurityHeader`.
+fn is_license_packet(user_data: &[u8]) -> bool {
+    user_data.len() >= 2 && u16::from_le_bytes([user_data[0], user_data[1]]) & SEC_LICENSE_PKT != 0
+}
+
+/// Skips past this count in a single state without a matching licensing PDU,
+/// `log_skipped_non_license_pdu` escalates from `debug!` to `warn!` — the
+/// deadline in `tessera-rdp-worker` (`CONNECT_PHASE_TIMEOUT`) is what bounds
+/// how long that can go on; this is purely a diagnostic trail so a real
+/// misbehaving-server hang is visible in a release run, not silent.
+const SKIP_WARN_THRESHOLD: u32 = 3;
+
+fn log_skipped_non_license_pdu(ctx: &ironrdp_pdu::mcs::SendDataIndicationCtx<'_>, state: &str, skip_count: u32) {
+    let flags = if ctx.user_data.len() >= 2 {
+        u16::from_le_bytes([ctx.user_data[0], ctx.user_data[1]])
+    } else {
+        0
+    };
+    if skip_count > SKIP_WARN_THRESHOLD {
+        warn!(
+            state,
+            skip_count,
+            security_header_flags = format_args!("{flags:#06x}"),
+            user_data_len = ctx.user_data.len(),
+            user_data = ?ctx.user_data,
+            "repeatedly skipping non-licensing PDUs received mid-licensing; still staying in this state"
+        );
+    } else {
+        debug!(
+            state,
+            skip_count,
+            security_header_flags = format_args!("{flags:#06x}"),
+            user_data_len = ctx.user_data.len(),
+            user_data = ?ctx.user_data,
+            "skipping a non-licensing PDU received mid-licensing; staying in this state"
+        );
+    }
+}
 
 #[derive(Default, Debug)]
 #[non_exhaustive]
@@ -64,6 +125,17 @@ pub struct LicenseExchangeSequence {
     pub domain: Option<String>,
     pub hardware_id: [u32; 4],
     pub license_cache: Arc<dyn LicenseCache>,
+    /// TESSERA PATCH — count of non-licensing PDUs skipped over the whole
+    /// license exchange; see `log_skipped_non_license_pdu`. A plain field
+    /// rather than threaded through each `LicenseExchangeState` variant:
+    /// `step` already takes `&mut self`, so a field here is equivalent to a
+    /// per-state counter modulo one semantic change — this counts skips
+    /// across all three waiting states cumulatively instead of resetting
+    /// per state — while avoiding the ~5 construction-site touch points
+    /// (every place a state is built) that threading it through the enum
+    /// required, on exactly the state-transition lines upstream rebases
+    /// churn most.
+    pub skip_count: u32,
 }
 
 // Use RefUnwindSafe so that types that embed LicenseCache remain UnwindSafe
@@ -100,6 +172,7 @@ impl LicenseExchangeSequence {
             domain,
             hardware_id,
             license_cache,
+            skip_count: 0,
         }
     }
 }
@@ -135,6 +208,14 @@ impl Sequence for LicenseExchangeSequence {
             LicenseExchangeState::NewLicenseRequest => {
                 let send_data_indication_ctx =
                     ironrdp_pdu::mcs::decode_send_data_indication(input).map_err(ConnectorError::decode)?;
+                // TESSERA PATCH — see rdp/ironrdp-fork.md.
+                if !is_license_packet(send_data_indication_ctx.user_data) {
+                    self.skip_count += 1;
+                    log_skipped_non_license_pdu(&send_data_indication_ctx, "NewLicenseRequest", self.skip_count);
+                    self.state = LicenseExchangeState::NewLicenseRequest;
+                    return Ok(Written::Nothing);
+                }
+
                 let license_pdu = send_data_indication_ctx
                     .decode_user_data::<LicensePdu>()
                     .map_err(ConnectorError::decode)
@@ -189,7 +270,9 @@ impl Sequence for LicenseExchangeSequence {
 
                                     (
                                         Written::from_size(written)?,
-                                        LicenseExchangeState::PlatformChallenge { encryption_data },
+                                        LicenseExchangeState::PlatformChallenge {
+                                            encryption_data,
+                                        },
                                     )
                                 }
                                 Err(err) => {
@@ -218,7 +301,9 @@ impl Sequence for LicenseExchangeSequence {
 
                                     (
                                         Written::from_size(written)?,
-                                        LicenseExchangeState::PlatformChallenge { encryption_data },
+                                        LicenseExchangeState::PlatformChallenge {
+                                            encryption_data,
+                                        },
                                     )
                                 }
                                 Err(error) => {
@@ -269,6 +354,14 @@ impl Sequence for LicenseExchangeSequence {
             LicenseExchangeState::PlatformChallenge { encryption_data } => {
                 let send_data_indication_ctx =
                     ironrdp_pdu::mcs::decode_send_data_indication(input).map_err(ConnectorError::decode)?;
+
+                // TESSERA PATCH — see rdp/ironrdp-fork.md.
+                if !is_license_packet(send_data_indication_ctx.user_data) {
+                    self.skip_count += 1;
+                    log_skipped_non_license_pdu(&send_data_indication_ctx, "PlatformChallenge", self.skip_count);
+                    self.state = LicenseExchangeState::PlatformChallenge { encryption_data };
+                    return Ok(Written::Nothing);
+                }
 
                 let license_pdu = send_data_indication_ctx
                     .decode_user_data::<LicensePdu>()
@@ -324,6 +417,14 @@ impl Sequence for LicenseExchangeSequence {
                 let send_data_indication_ctx =
                     ironrdp_pdu::mcs::decode_send_data_indication(input).map_err(ConnectorError::decode)?;
 
+                // TESSERA PATCH — see rdp/ironrdp-fork.md.
+                if !is_license_packet(send_data_indication_ctx.user_data) {
+                    self.skip_count += 1;
+                    log_skipped_non_license_pdu(&send_data_indication_ctx, "UpgradeLicense", self.skip_count);
+                    self.state = LicenseExchangeState::UpgradeLicense { encryption_data };
+                    return Ok(Written::Nothing);
+                }
+
                 let license_pdu = send_data_indication_ctx
                     .decode_user_data::<LicensePdu>()
                     .map_err(ConnectorError::decode)
@@ -372,5 +473,100 @@ impl Sequence for LicenseExchangeSequence {
         self.state = next_state;
 
         Ok(written)
+    }
+}
+
+// TESSERA PATCH — tests for the skip-and-stay guard above (rdp/ironrdp-fork.md).
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The exact bytes captured from the incident (rdp/ironrdp-fork.md):
+    /// `BasicSecurityHeader.flags = 0x1000` (SEC_AUTODETECT_REQ), not a
+    /// licensing packet at all.
+    const CAPTURED_AUTODETECT_PROBE: [u8; 10] = [0, 16, 0, 0, 6, 0, 0, 0, 20, 0];
+
+    #[test]
+    fn captured_autodetect_probe_is_rejected() {
+        assert!(!is_license_packet(&CAPTURED_AUTODETECT_PROBE));
+    }
+
+    #[test]
+    fn sec_license_pkt_alone_is_accepted() {
+        // flags = 0x0080, little-endian.
+        let payload = [0x80, 0x00];
+        assert!(is_license_packet(&payload));
+    }
+
+    #[test]
+    fn sec_license_pkt_with_other_bits_is_accepted() {
+        // flags = 0x1080 (SEC_AUTODETECT_REQ | SEC_LICENSE_PKT), little-endian.
+        let payload = [0x80, 0x10];
+        assert!(is_license_packet(&payload));
+    }
+
+    #[test]
+    fn empty_payload_is_rejected_without_panicking() {
+        assert!(!is_license_packet(&[]));
+    }
+
+    #[test]
+    fn one_byte_payload_is_rejected_without_panicking() {
+        assert!(!is_license_packet(&[0x80]));
+    }
+
+    /// Drives `LicenseExchangeSequence` through repeated auto-detect probes
+    /// (the captured bytes, wrapped in a real Send Data Indication) and
+    /// checks the skip counter climbs and the state never advances. This
+    /// does not observe the `debug!`/`warn!` log-level escalation directly —
+    /// no lightweight tracing harness is wired into this crate — but it
+    /// covers the counting logic `log_skipped_non_license_pdu`'s threshold
+    /// check depends on.
+    ///
+    /// `skip_count` lives on `LicenseExchangeSequence` itself (not on
+    /// `LicenseExchangeState`), so it is read off `sequence.skip_count`
+    /// directly rather than destructured out of the state — and it is
+    /// cumulative across the whole exchange, not reset per state, which is
+    /// exactly what this test pins.
+    #[test]
+    fn skip_counter_climbs_and_state_stays_put_across_repeated_probes() {
+        let mut sequence =
+            LicenseExchangeSequence::new(1001, "tessera".to_owned(), None, [0; 4], Arc::new(NoopLicenseCache));
+
+        // initiator_id is PER-encoded relative to MCS's BASE_CHANNEL_ID (1001);
+        // anything lower underflows the encoder.
+        let probe_pdu = encode_send_data_indication(1001, 1001, &CAPTURED_AUTODETECT_PROBE);
+        let mut output = WriteBuf::new();
+
+        for expected_skip_count in 1..=(SKIP_WARN_THRESHOLD + 2) {
+            let written = sequence
+                .step(&probe_pdu, None, &mut output)
+                .expect("skip-and-stay must not error");
+            assert!(matches!(written, Written::Nothing));
+
+            assert!(
+                matches!(&sequence.state, LicenseExchangeState::NewLicenseRequest),
+                "expected to stay in NewLicenseRequest, got {:?}",
+                sequence.state
+            );
+            assert_eq!(sequence.skip_count, expected_skip_count);
+        }
+    }
+
+    /// Builds a Send Data Indication PDU carrying `user_data` verbatim,
+    /// matching the wire shape `ironrdp_pdu::mcs::decode_send_data_indication`
+    /// expects — i.e. what a server actually sends, as opposed to
+    /// `encode_send_data_request` (client -> server) used by production code
+    /// above.
+    fn encode_send_data_indication(initiator_id: u16, channel_id: u16, user_data: &[u8]) -> Vec<u8> {
+        let pdu = ironrdp_pdu::mcs::SendDataIndication {
+            initiator_id,
+            channel_id,
+            user_data: std::borrow::Cow::Borrowed(user_data),
+        };
+        let mut buf = WriteBuf::new();
+        ironrdp_core::encode_buf(&ironrdp_pdu::x224::X224(pdu), &mut buf)
+            .expect("encoding a Send Data Indication for the test fixture must not fail");
+        buf.into_inner()
     }
 }
