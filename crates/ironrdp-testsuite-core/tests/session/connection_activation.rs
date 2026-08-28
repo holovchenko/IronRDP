@@ -103,7 +103,7 @@ fn demand_active_static_channel_chunk_size(chunk_size: Option<u32>) -> usize {
         .expect("server demand active should include a virtual channel capability");
     virtual_channel.chunk_size = chunk_size;
 
-    let mut sequence = ConnectionActivationSequence::new(test_config(), IO_CHANNEL_ID, USER_CHANNEL_ID);
+    let mut sequence = ConnectionActivationSequence::new(test_config(), IO_CHANNEL_ID, USER_CHANNEL_ID, None);
     let mut output = WriteBuf::new();
     let frame = encode_server_share_control(ShareControlPdu::ServerDemandActive(demand_active));
     sequence
@@ -149,7 +149,7 @@ fn demand_active_falls_back_to_default_static_channel_chunk_size() {
 #[test]
 fn deactivate_all_during_capabilities_exchange_stays_in_same_state() {
     let config = test_config();
-    let mut seq = ConnectionActivationSequence::new(config, IO_CHANNEL_ID, USER_CHANNEL_ID);
+    let mut seq = ConnectionActivationSequence::new(config, IO_CHANNEL_ID, USER_CHANNEL_ID, None);
 
     let frame = encode_server_share_control(ShareControlPdu::ServerDeactivateAll(ServerDeactivateAll));
     let mut output = WriteBuf::new();
@@ -160,7 +160,7 @@ fn deactivate_all_during_capabilities_exchange_stays_in_same_state() {
     assert!(
         matches!(
             seq.connection_activation_state(),
-            ConnectionActivationState::CapabilitiesExchange
+            ConnectionActivationState::CapabilitiesExchange { .. }
         ),
         "state should remain CapabilitiesExchange after DeactivateAll"
     );
@@ -171,7 +171,7 @@ fn client_connector_stays_in_capabilities_exchange_on_deactivate_all() {
     let config = test_config();
     let mut connector = ClientConnector::new(config.clone(), "127.0.0.1:3389".parse().unwrap());
     connector.state = ClientConnectorState::CapabilitiesExchange {
-        connection_activation: ConnectionActivationSequence::new(config, IO_CHANNEL_ID, USER_CHANNEL_ID),
+        connection_activation: ConnectionActivationSequence::new(config, IO_CHANNEL_ID, USER_CHANNEL_ID, None),
     };
 
     let frame = encode_server_share_control(ShareControlPdu::ServerDeactivateAll(ServerDeactivateAll));
@@ -193,7 +193,7 @@ fn set_error_info_during_capabilities_exchange_surfaces_the_disconnect_reason() 
     // reason. The sequence must surface that reason rather than a generic
     // "unexpected Share Control PDU" error.
     let config = test_config();
-    let mut seq = ConnectionActivationSequence::new(config, IO_CHANNEL_ID, USER_CHANNEL_ID);
+    let mut seq = ConnectionActivationSequence::new(config, IO_CHANNEL_ID, USER_CHANNEL_ID, None);
 
     let error_info = ShareControlPdu::Data(ShareDataHeader {
         share_data_pdu: ShareDataPdu::ServerSetErrorInfo(ServerSetErrorInfoPdu(ErrorInfo::ProtocolIndependentCode(
@@ -227,7 +227,7 @@ fn none_error_info_during_capabilities_exchange_is_skipped() {
     // be skipped (staying in Capabilities Exchange to await Demand Active), not treated
     // as a session-ending error.
     let config = test_config();
-    let mut seq = ConnectionActivationSequence::new(config, IO_CHANNEL_ID, USER_CHANNEL_ID);
+    let mut seq = ConnectionActivationSequence::new(config, IO_CHANNEL_ID, USER_CHANNEL_ID, None);
 
     let none_error_info = ShareControlPdu::Data(ShareDataHeader {
         share_data_pdu: ShareDataPdu::ServerSetErrorInfo(ServerSetErrorInfoPdu(ErrorInfo::ProtocolIndependentCode(
@@ -246,7 +246,7 @@ fn none_error_info_during_capabilities_exchange_is_skipped() {
     assert!(
         matches!(
             seq.connection_activation_state(),
-            ConnectionActivationState::CapabilitiesExchange
+            ConnectionActivationState::CapabilitiesExchange { .. }
         ),
         "state should remain CapabilitiesExchange after a benign ERRINFO_NONE PDU"
     );
@@ -255,7 +255,7 @@ fn none_error_info_during_capabilities_exchange_is_skipped() {
 #[test]
 fn demand_active_after_deactivate_all_transitions_to_connection_finalization() {
     let config = test_config();
-    let mut seq = ConnectionActivationSequence::new(config, IO_CHANNEL_ID, USER_CHANNEL_ID);
+    let mut seq = ConnectionActivationSequence::new(config, IO_CHANNEL_ID, USER_CHANNEL_ID, None);
     let mut output = WriteBuf::new();
 
     // First: feed DeactivateAll
@@ -283,7 +283,7 @@ fn demand_active_captures_server_input_flags() {
     use ironrdp_pdu::rdp::capability_sets::InputFlags;
 
     let config = test_config();
-    let mut seq = ConnectionActivationSequence::new(config, IO_CHANNEL_ID, USER_CHANNEL_ID);
+    let mut seq = ConnectionActivationSequence::new(config, IO_CHANNEL_ID, USER_CHANNEL_ID, None);
     let mut output = WriteBuf::new();
 
     let frame = encode_server_share_control(ShareControlPdu::ServerDemandActive(SERVER_DEMAND_ACTIVE.clone()));
@@ -306,7 +306,7 @@ fn demand_active_without_input_capability_yields_empty_input_flags() {
     use ironrdp_pdu::rdp::capability_sets::{CapabilitySet, InputFlags};
 
     let config = test_config();
-    let mut seq = ConnectionActivationSequence::new(config, IO_CHANNEL_ID, USER_CHANNEL_ID);
+    let mut seq = ConnectionActivationSequence::new(config, IO_CHANNEL_ID, USER_CHANNEL_ID, None);
     let mut output = WriteBuf::new();
 
     let mut demand_active = SERVER_DEMAND_ACTIVE.clone();
@@ -641,7 +641,7 @@ fn failing_to_respond_leaves_the_connector_able_to_act() {
 fn complete_multitransport_outside_pending_state_errors() {
     let mut connector = ClientConnector::new(test_config(), "127.0.0.1:3389".parse().unwrap());
     connector.state = ClientConnectorState::CapabilitiesExchange {
-        connection_activation: ConnectionActivationSequence::new(test_config(), IO_CHANNEL_ID, USER_CHANNEL_ID),
+        connection_activation: ConnectionActivationSequence::new(test_config(), IO_CHANNEL_ID, USER_CHANNEL_ID, None),
     };
     let mut output = WriteBuf::new();
 
