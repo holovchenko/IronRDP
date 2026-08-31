@@ -27,6 +27,13 @@ use crate::{
 /// transport protocol: reliable + lossy UDP).
 const MAX_MULTITRANSPORT_REQUESTS: usize = 2;
 
+/// Skips past this count in `MultitransportBootstrapping` without a matching
+/// multitransport request, [`log_skipped_non_multitransport_pdu`] escalates from
+/// `debug!` to `warn!`. The phase has no deadline of its own — it ends on the
+/// Demand Active, which only the server can send — so this trail is what makes a
+/// server stuck probing visible in a release run instead of silent.
+const MULTITRANSPORT_SKIP_WARN_THRESHOLD: u32 = 3;
+
 /// Size of the auto-detect header that precedes a Bandwidth Measure payload.
 ///
 /// `headerLength` + `headerTypeId` + `sequenceNumber` + `requestType` +
@@ -343,6 +350,10 @@ pub struct ClientConnector {
     /// Only accumulated while a window is open, since a total with no interval to
     /// divide it by is not a measurement of anything.
     connect_time_bw_bytes: u32,
+    /// How many message-channel PDUs multitransport bootstrapping has skipped
+    /// for not being multitransport requests. Feeds nothing but
+    /// [`log_skipped_non_multitransport_pdu`]'s `debug!`/`warn!` choice.
+    multitransport_skip_count: u32,
 }
 
 impl ClientConnector {
@@ -360,6 +371,7 @@ impl ClientConnector {
             auto_reconnect_cookie: None,
             connect_time_bw_started_at: None,
             connect_time_bw_bytes: 0,
+            multitransport_skip_count: 0,
         }
     }
 
@@ -947,6 +959,80 @@ impl ClientConnector {
     }
 }
 
+// TESSERA PATCH (vendored fork — see rdp/ironrdp-fork.md for the full story).
+//
+// Third appearance of one defect class: a PDU that is not what the current phase
+// expects, fed straight into a decoder. Guard 1 covers the licensing exchange,
+// guard 2 the connection activation; multitransport bootstrapping — the state
+// between the two — had nothing, and that is where a real connection died.
+//
+// The same Windows RDS host interleaves Auto-Detect Requests here too. They
+// travel on the MCS message channel, which is also where Initiate Multitransport
+// Requests travel, so routing by channel cannot separate them. The observed
+// payload was `[0, 16, 0, 0, 6, 0, 0, 0, 20, 0]`: flags `0x1000`
+// (SEC_AUTODETECT_REQ, not SEC_TRANSPORT_REQ), headerLength 6, headerTypeId 0,
+// sequenceNumber 0, requestType `0x0014`. Ten bytes handed to
+// `MultitransportRequestPdu::decode`, whose fixed part is 28, failed the whole
+// connection with a bare "decode error".
+//
+// So: check the security header before decoding, and skip anything that is not a
+// multitransport request WITHOUT leaving the state — a request the server has yet
+// to send is still to come, and the phase ends on the Demand Active from the I/O
+// channel, which the arm below already handles. Not answering the probe is
+// allowed; auto-detect is advisory and the server proceeds regardless.
+
+/// Whether this MCS user data is an Initiate Multitransport Request at all,
+/// judged by the `BasicSecurityHeader.flags` it starts with.
+///
+/// Deliberately reaches the same verdict from those flags that
+/// [`rdp::multitransport::MultitransportRequestPdu`]'s own `decode` does
+/// ([MS-RDPBCGR] 2.2.15.1): `from_bits_truncate` to tolerate unknown bits, the
+/// two sequence-number flags [MS-RDPBCGR] 2.2.8.1.1.2.1 says MUST be ignored
+/// masked off, and what remains compared for equality — a `contains` check would
+/// accept SEC_AUTODETECT_REQ alongside. Keeping the two in step is what makes
+/// this a routing decision rather than a second, weaker parser: whatever this
+/// accepts, `decode` still has the final say on.
+fn is_multitransport_request(user_data: &[u8]) -> bool {
+    let Some(raw_flags) = user_data.get(..2) else {
+        return false;
+    };
+
+    let flags =
+        rdp::headers::BasicSecurityHeaderFlags::from_bits_truncate(u16::from_le_bytes([raw_flags[0], raw_flags[1]]));
+
+    flags.difference(
+        rdp::headers::BasicSecurityHeaderFlags::RESET_SEQNO | rdp::headers::BasicSecurityHeaderFlags::IGNORE_SEQNO,
+    ) == rdp::headers::BasicSecurityHeaderFlags::TRANSPORT_REQ
+}
+
+/// Records a skipped message-channel PDU, escalating to `warn!` past
+/// [`MULTITRANSPORT_SKIP_WARN_THRESHOLD`] so a server that never stops probing
+/// is visible rather than silent.
+fn log_skipped_non_multitransport_pdu(ctx: &mcs::SendDataIndicationCtx<'_>, skip_count: u32) {
+    let flags = if ctx.user_data.len() >= 2 {
+        u16::from_le_bytes([ctx.user_data[0], ctx.user_data[1]])
+    } else {
+        0
+    };
+    if skip_count > MULTITRANSPORT_SKIP_WARN_THRESHOLD {
+        warn!(
+            skip_count,
+            security_header_flags = format_args!("{flags:#06x}"),
+            user_data_len = ctx.user_data.len(),
+            user_data = ?ctx.user_data,
+            "repeatedly skipping non-multitransport PDUs during multitransport bootstrapping; still staying in this state"
+        );
+    } else {
+        debug!(
+            skip_count,
+            security_header_flags = format_args!("{flags:#06x}"),
+            user_data_len = ctx.user_data.len(),
+            user_data = ?ctx.user_data,
+            "skipping a non-multitransport PDU received during multitransport bootstrapping; staying in this state"
+        );
+    }
+}
+
 /// Build an Initiate Multitransport Response carrying `hr_response`.
 ///
 /// [`MultitransportResponsePdu::success`] covers `S_OK`; every other HRESULT,
@@ -1400,11 +1486,11 @@ impl Sequence for ClientConnector {
             // handshake outright. Each request is surfaced the moment it decodes,
             // per MS-RDPBCGR 3.2.5.15.1.
             //
-            // Routing is by channel. Requests travel on the MCS message channel; the
-            // Demand Active is on the I/O channel and ends the phase. The message
-            // channel also carries auto-detect PDUs, so a decode still confirms what
-            // arrived there, but the I/O channel is never speculatively decoded as
-            // multitransport any more.
+            // Routing is by channel, then by security header. Requests travel on the
+            // MCS message channel; the Demand Active is on the I/O channel and ends
+            // the phase, and is never speculatively decoded as multitransport. The
+            // message channel also carries auto-detect traffic, which the channel
+            // alone cannot separate from a request — see `is_multitransport_request`.
             ClientConnectorState::MultitransportBootstrapping {
                 io_channel_id,
                 user_channel_id,
@@ -1414,41 +1500,57 @@ impl Sequence for ClientConnector {
                 let ctx = mcs::decode_send_data_indication(input).map_err(ConnectorError::decode)?;
 
                 if Some(ctx.channel_id) == message_channel_id {
-                    let pdu = decode::<rdp::multitransport::MultitransportRequestPdu>(ctx.user_data)
-                        .map_err(ConnectorError::decode)?;
+                    // TESSERA PATCH — see `is_multitransport_request` above.
+                    if is_multitransport_request(ctx.user_data) {
+                        let pdu = decode::<rdp::multitransport::MultitransportRequestPdu>(ctx.user_data)
+                            .map_err(ConnectorError::decode)?;
 
-                    if requests_seen >= MAX_MULTITRANSPORT_REQUESTS {
-                        return Err(reason_err!(
-                            "MultitransportBootstrapping",
-                            "server sent more than {} multitransport requests (MS-RDPBCGR 2.2.15.1 caps the count at {})",
-                            MAX_MULTITRANSPORT_REQUESTS,
-                            MAX_MULTITRANSPORT_REQUESTS,
-                        ));
+                        if requests_seen >= MAX_MULTITRANSPORT_REQUESTS {
+                            return Err(reason_err!(
+                                "MultitransportBootstrapping",
+                                "server sent more than {} multitransport requests (MS-RDPBCGR 2.2.15.1 caps the count at {})",
+                                MAX_MULTITRANSPORT_REQUESTS,
+                                MAX_MULTITRANSPORT_REQUESTS,
+                            ));
+                        }
+
+                        debug!(
+                            request_id = pdu.request_id,
+                            protocol = ?pdu.requested_protocol,
+                            "Received Initiate Multitransport Request"
+                        );
+
+                        // Captured on entry rather than read back at completion time: the
+                        // GCC exchange carrying both peers' flags is long finished, and
+                        // freezing it here keeps the response paths from depending on
+                        // connector fields that could move in between.
+                        let soft_sync = self.soft_sync_negotiated();
+
+                        (
+                            Written::Nothing,
+                            ClientConnectorState::MultitransportPending {
+                                io_channel_id,
+                                user_channel_id,
+                                message_channel_id,
+                                request: pdu,
+                                requests_seen: requests_seen + 1,
+                                soft_sync,
+                            },
+                        )
+                    } else {
+                        self.multitransport_skip_count = self.multitransport_skip_count.saturating_add(1);
+                        log_skipped_non_multitransport_pdu(&ctx, self.multitransport_skip_count);
+
+                        (
+                            Written::Nothing,
+                            ClientConnectorState::MultitransportBootstrapping {
+                                io_channel_id,
+                                user_channel_id,
+                                message_channel_id,
+                                requests_seen,
+                            },
+                        )
                     }
-
-                    debug!(
-                        request_id = pdu.request_id,
-                        protocol = ?pdu.requested_protocol,
-                        "Received Initiate Multitransport Request"
-                    );
-
-                    // Captured on entry rather than read back at completion time: the
-                    // GCC exchange carrying both peers' flags is long finished, and
-                    // freezing it here keeps the response paths from depending on
-                    // connector fields that could move in between.
-                    let soft_sync = self.soft_sync_negotiated();
-
-                    (
-                        Written::Nothing,
-                        ClientConnectorState::MultitransportPending {
-                            io_channel_id,
-                            user_channel_id,
-                            message_channel_id,
-                            request: pdu,
-                            requests_seen: requests_seen + 1,
-                            soft_sync,
-                        },
-                    )
                 } else if ctx.channel_id == io_channel_id {
                     // Demand Active: bootstrapping is over, hand off to capabilities
                     // exchange with the PDU intact.
@@ -1839,10 +1941,15 @@ fn create_client_info_pdu(
 mod tests {
     use ironrdp_pdu::rdp::capability_sets::{MajorPlatformType, RailSupportLevel};
     use ironrdp_pdu::rdp::client_info::ClientInfoFlags;
-    use ironrdp_pdu::{gcc, nego};
+    use ironrdp_pdu::{gcc, nego, rdp};
 
-    use super::{create_client_info_pdu, create_gcc_blocks};
-    use crate::{Config, Credentials, DesktopSize};
+    use ironrdp_core::WriteBuf;
+
+    use super::{
+        ClientConnector, ClientConnectorState, MULTITRANSPORT_SKIP_WARN_THRESHOLD, create_client_info_pdu,
+        create_gcc_blocks, is_multitransport_request,
+    };
+    use crate::{Config, Credentials, DesktopSize, Sequence as _, State as _, Written};
 
     #[test]
     fn remote_application_client_info_uses_rail_launch_data() {
@@ -2084,5 +2191,234 @@ mod tests {
         )
         .expect("valid GCC Client Cluster Data");
         assert_eq!(blocks.cluster, Some(cluster_data));
+    }
+
+    /// The exact bytes captured from the failing connection (see
+    /// `rdp/ironrdp-fork.md` in the Tessera repository): an Auto-Detect
+    /// Request whose `BasicSecurityHeader.flags` are `0x1000`
+    /// (SEC_AUTODETECT_REQ). It is not a multitransport request at all, but it
+    /// arrives on the MCS message channel, which is where multitransport
+    /// requests also arrive.
+    const CAPTURED_AUTODETECT_PROBE: [u8; 10] = [0, 16, 0, 0, 6, 0, 0, 0, 20, 0];
+
+    const TEST_IO_CHANNEL_ID: u16 = 1003;
+    const TEST_MESSAGE_CHANNEL_ID: u16 = 1004;
+    const TEST_USER_CHANNEL_ID: u16 = 1007;
+
+    fn minimal_config() -> Config {
+        Config {
+            desktop_size: DesktopSize {
+                width: 1024,
+                height: 768,
+            },
+            monitor_layout: None,
+            desktop_scale_factor: 0,
+            enable_tls: true,
+            enable_credssp: false,
+            enable_standard_rdp_security: false,
+            credentials: Credentials::UsernamePassword {
+                username: "test".into(),
+                password: "test".into(),
+            },
+            domain: None,
+            client_build: 0,
+            client_name: "test".into(),
+            keyboard_type: gcc::KeyboardType::IBM_ENHANCED,
+            keyboard_subtype: 0,
+            keyboard_functional_keys_count: 12,
+            keyboard_layout: 0,
+            connection_type: gcc::ConnectionType::Lan,
+            ime_file_name: String::new(),
+            bitmap: None,
+            dig_product_id: String::new(),
+            client_dir: String::new(),
+            alternate_shell: String::new(),
+            work_dir: String::new(),
+            remote_application_mode: false,
+            rail_support_level: RailSupportLevel::SUPPORTED,
+            platform: MajorPlatformType::UNIX,
+            hardware_id: None,
+            request_data: None,
+            autologon: false,
+            enable_audio_playback: false,
+            enable_audio_capture: false,
+            performance_flags: Default::default(),
+            license_cache: None,
+            timezone_info: Default::default(),
+            compression_type: None,
+            enable_server_pointer: false,
+            pointer_software_rendering: false,
+            multitransport_flags: None,
+        }
+    }
+
+    /// A connector parked in [`ClientConnectorState::MultitransportBootstrapping`],
+    /// which is where the connector sits between a finished licensing exchange
+    /// and the Demand Active.
+    fn connector_in_multitransport_bootstrapping() -> ClientConnector {
+        let mut connector = ClientConnector::new(minimal_config(), "127.0.0.1:3389".parse().unwrap());
+        connector.message_channel_id = Some(TEST_MESSAGE_CHANNEL_ID);
+        connector.state = ClientConnectorState::MultitransportBootstrapping {
+            io_channel_id: TEST_IO_CHANNEL_ID,
+            user_channel_id: TEST_USER_CHANNEL_ID,
+            message_channel_id: Some(TEST_MESSAGE_CHANNEL_ID),
+            requests_seen: 0,
+        };
+        connector
+    }
+
+    /// Builds a Send Data Indication PDU carrying `user_data` verbatim,
+    /// matching the wire shape `ironrdp_pdu::mcs::decode_send_data_indication`
+    /// expects — i.e. what a server actually sends.
+    ///
+    /// `initiator_id` is PER-encoded relative to MCS's BASE_CHANNEL_ID (1001);
+    /// anything lower underflows the encoder.
+    fn encode_send_data_indication(initiator_id: u16, channel_id: u16, user_data: &[u8]) -> Vec<u8> {
+        let pdu = ironrdp_pdu::mcs::SendDataIndication {
+            initiator_id,
+            channel_id,
+            user_data: std::borrow::Cow::Borrowed(user_data),
+        };
+        let mut buf = WriteBuf::new();
+        ironrdp_core::encode_buf(&ironrdp_pdu::x224::X224(pdu), &mut buf)
+            .expect("encoding a Send Data Indication for the test fixture must not fail");
+        buf.into_inner()
+    }
+
+    #[test]
+    fn captured_autodetect_probe_is_not_a_multitransport_request() {
+        assert!(!is_multitransport_request(&CAPTURED_AUTODETECT_PROBE));
+    }
+
+    #[test]
+    fn sec_transport_req_alone_is_a_multitransport_request() {
+        // flags = 0x0002, little-endian.
+        assert!(is_multitransport_request(&[0x02, 0x00]));
+    }
+
+    /// [MS-RDPBCGR] 2.2.8.1.1.2.1 says SEC_RESET_SEQNO (0x0010) and
+    /// SEC_IGNORE_SEQNO (0x0020) MUST be ignored, so their presence must not
+    /// turn a request into something to skip.
+    #[test]
+    fn sec_transport_req_with_ignorable_seqno_flags_is_a_multitransport_request() {
+        // flags = 0x0032, little-endian.
+        assert!(is_multitransport_request(&[0x32, 0x00]));
+    }
+
+    /// The response flag is the client -> server direction; seeing it inbound is
+    /// not a request, and a `contains`-style check would have accepted it.
+    #[test]
+    fn sec_transport_rsp_is_not_a_multitransport_request() {
+        // flags = 0x0004, little-endian.
+        assert!(!is_multitransport_request(&[0x04, 0x00]));
+    }
+
+    #[test]
+    fn short_payloads_are_rejected_without_panicking() {
+        assert!(!is_multitransport_request(&[]));
+        assert!(!is_multitransport_request(&[0x02]));
+    }
+
+    /// A Windows RDS host interleaves auto-detect probes into every phase of
+    /// the connection sequence, multitransport bootstrapping included. They
+    /// arrive on the message channel, which is also where Initiate
+    /// Multitransport Requests arrive, so channel routing alone does not tell
+    /// them apart — and feeding one to `MultitransportRequestPdu::decode`
+    /// killed the whole connection with a bare "decode error".
+    ///
+    /// Drives the probe through repeatedly: the skip counter must climb and the
+    /// state must not move. Like guard 1's twin test this does not observe the
+    /// `debug!`/`warn!` escalation itself — no tracing harness is wired into
+    /// this crate — but it covers the counting `log_skipped_non_multitransport_pdu`
+    /// reads.
+    #[test]
+    fn autodetect_probe_during_multitransport_bootstrapping_is_skipped_not_fatal() {
+        let mut connector = connector_in_multitransport_bootstrapping();
+        let probe = encode_send_data_indication(
+            TEST_USER_CHANNEL_ID,
+            TEST_MESSAGE_CHANNEL_ID,
+            &CAPTURED_AUTODETECT_PROBE,
+        );
+        let mut output = WriteBuf::new();
+
+        for expected_skip_count in 1..=(MULTITRANSPORT_SKIP_WARN_THRESHOLD + 2) {
+            let written = connector
+                .step(&probe, None, &mut output)
+                .expect("an auto-detect probe must not fail multitransport bootstrapping");
+
+            assert!(matches!(written, Written::Nothing));
+            assert!(
+                matches!(
+                    connector.state,
+                    ClientConnectorState::MultitransportBootstrapping { requests_seen: 0, .. }
+                ),
+                "expected to stay in MultitransportBootstrapping with the request count untouched, got {}",
+                connector.state.name()
+            );
+            assert_eq!(connector.multitransport_skip_count, expected_skip_count);
+        }
+    }
+
+    /// The guard must not swallow the thing the phase exists for: a real
+    /// request on the same channel still suspends the connector for the caller.
+    #[test]
+    fn a_real_multitransport_request_still_suspends_the_connector() {
+        let mut connector = connector_in_multitransport_bootstrapping();
+        let request = rdp::multitransport::MultitransportRequestPdu {
+            security_header: rdp::headers::BasicSecurityHeader {
+                flags: rdp::headers::BasicSecurityHeaderFlags::TRANSPORT_REQ,
+            },
+            request_id: 7,
+            requested_protocol: rdp::multitransport::RequestedProtocol::UdpFecR,
+            security_cookie: [0; 16],
+        };
+        let user_data = ironrdp_core::encode_vec(&request).expect("encoding the request fixture must not fail");
+        let pdu = encode_send_data_indication(TEST_USER_CHANNEL_ID, TEST_MESSAGE_CHANNEL_ID, &user_data);
+        let mut output = WriteBuf::new();
+
+        connector
+            .step(&pdu, None, &mut output)
+            .expect("a well-formed multitransport request must be accepted");
+
+        assert!(
+            matches!(
+                connector.state,
+                ClientConnectorState::MultitransportPending { requests_seen: 1, .. }
+            ),
+            "expected MultitransportPending after a real request, got {}",
+            connector.state.name()
+        );
+        assert_eq!(connector.multitransport_skip_count, 0);
+    }
+
+    /// The phase has no end marker of its own: it ends when the Demand Active
+    /// arrives on the I/O channel. Skipping message-channel probes must leave
+    /// that exit intact.
+    #[test]
+    fn a_pdu_on_the_io_channel_still_ends_the_phase_after_skips() {
+        let mut connector = connector_in_multitransport_bootstrapping();
+        let probe = encode_send_data_indication(
+            TEST_USER_CHANNEL_ID,
+            TEST_MESSAGE_CHANNEL_ID,
+            &CAPTURED_AUTODETECT_PROBE,
+        );
+        let mut output = WriteBuf::new();
+
+        connector.step(&probe, None, &mut output).expect("probe is skipped");
+
+        // Not a valid Demand Active — reaching the capabilities-exchange decoder
+        // at all is the point, and that decoder rejecting these bytes proves the
+        // PDU left multitransport bootstrapping rather than being skipped again.
+        let io_pdu = encode_send_data_indication(TEST_USER_CHANNEL_ID, TEST_IO_CHANNEL_ID, &[0u8; 8]);
+        let _ = connector.step(&io_pdu, None, &mut output);
+
+        assert!(
+            !matches!(
+                connector.state,
+                ClientConnectorState::MultitransportBootstrapping { .. }
+            ),
+            "an I/O-channel PDU must end the phase, but the connector stayed in {}",
+            connector.state.name()
+        );
     }
 }
