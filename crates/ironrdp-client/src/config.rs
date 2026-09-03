@@ -1885,6 +1885,7 @@ impl ConfigBuilder {
             autologon: self.autologon.unwrap_or(false),
             enable_audio_playback: self.enable_audio_playback.unwrap_or(true),
             enable_audio_capture: self.enable_audio_capture.unwrap_or(false),
+            enable_graphics_pipeline: false,
             request_data: None,
             pointer_software_rendering: self.pointer_software_rendering.unwrap_or(false),
             multitransport_flags: None,

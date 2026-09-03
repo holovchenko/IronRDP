@@ -262,6 +262,18 @@ pub struct Config {
     /// If true, client microphone capture is enabled and `INFO_AUDIOCAPTURE` is set
     /// in the [`ClientInfoPdu`](ironrdp_pdu::rdp::ClientInfoPdu).
     pub enable_audio_capture: bool,
+    /// If true, `RNS_UD_CS_SUPPORT_DYNVC_GFX_PROTOCOL` is set in the Client Core Data
+    /// `earlyCapabilityFlags`, telling the server this client supports the Graphics
+    /// Pipeline Extension ([MS-RDPEGFX]). A Windows server only opens the
+    /// `Microsoft::Windows::RDS::Graphics` dynamic virtual channel when the client
+    /// advertises this; without it the session stays on legacy bitmap updates no
+    /// matter which DVC processors are registered. Set it exactly when a
+    /// `GraphicsPipelineClient` is registered on the `DrdynvcClient` — advertising
+    /// support and then refusing the channel is not a state a server is expected to
+    /// handle. [MS-RDPBCGR] 2.2.1.3.2 also requires network characteristics
+    /// detection support alongside this flag; `SUPPORT_NET_CHAR_AUTODETECT` is
+    /// always set, so that requirement is met.
+    pub enable_graphics_pipeline: bool,
     pub performance_flags: PerformanceFlags,
 
     pub license_cache: Option<Arc<dyn LicenseCache>>,

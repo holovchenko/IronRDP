@@ -1782,6 +1782,9 @@ fn create_gcc_blocks<'a>(
                     if extended_client_data_supported {
                         early_capability_flags |= ClientEarlyCapabilityFlags::SUPPORT_MONITOR_LAYOUT_PDU;
                     }
+                    if config.enable_graphics_pipeline {
+                        early_capability_flags |= ClientEarlyCapabilityFlags::SUPPORT_DYN_VC_GFX_PROTOCOL;
+                    }
 
                     Some(early_capability_flags)
                 },
@@ -1989,6 +1992,7 @@ mod tests {
             autologon: false,
             enable_audio_playback: false,
             enable_audio_capture: false,
+            enable_graphics_pipeline: false,
             performance_flags: Default::default(),
             license_cache: None,
             timezone_info: Default::default(),
@@ -2044,6 +2048,7 @@ mod tests {
             autologon: false,
             enable_audio_playback: true,
             enable_audio_capture: true,
+            enable_graphics_pipeline: false,
             performance_flags: Default::default(),
             license_cache: None,
             timezone_info: Default::default(),
@@ -2108,6 +2113,7 @@ mod tests {
             autologon: false,
             enable_audio_playback: false,
             enable_audio_capture: false,
+            enable_graphics_pipeline: false,
             performance_flags: Default::default(),
             license_cache: None,
             timezone_info: Default::default(),
@@ -2193,6 +2199,78 @@ mod tests {
         assert_eq!(blocks.cluster, Some(cluster_data));
     }
 
+    fn test_config(enable_graphics_pipeline: bool) -> Config {
+        Config {
+            desktop_size: DesktopSize {
+                width: 1024,
+                height: 768,
+            },
+            monitor_layout: None,
+            desktop_scale_factor: 0,
+            enable_tls: true,
+            enable_credssp: false,
+            enable_standard_rdp_security: false,
+            credentials: Credentials::UsernamePassword {
+                username: "test".into(),
+                password: "test".into(),
+            },
+            domain: None,
+            client_build: 0,
+            client_name: "test".into(),
+            keyboard_type: gcc::KeyboardType::IBM_ENHANCED,
+            keyboard_subtype: 0,
+            keyboard_functional_keys_count: 12,
+            keyboard_layout: 0,
+            connection_type: gcc::ConnectionType::Lan,
+            ime_file_name: String::new(),
+            bitmap: None,
+            dig_product_id: String::new(),
+            client_dir: String::new(),
+            alternate_shell: String::new(),
+            work_dir: String::new(),
+            remote_application_mode: false,
+            rail_support_level: RailSupportLevel::empty(),
+            platform: MajorPlatformType::UNIX,
+            hardware_id: None,
+            request_data: None,
+            autologon: false,
+            enable_audio_playback: false,
+            enable_audio_capture: false,
+            enable_graphics_pipeline,
+            performance_flags: Default::default(),
+            license_cache: None,
+            timezone_info: Default::default(),
+            compression_type: None,
+            enable_server_pointer: false,
+            pointer_software_rendering: false,
+            multitransport_flags: None,
+        }
+    }
+
+    #[test]
+    fn graphics_pipeline_early_capability_follows_config() {
+        let config = test_config(true);
+        let blocks = create_gcc_blocks(&config, None, nego::SecurityProtocol::HYBRID_EX, false, core::iter::empty())
+            .expect("valid GCC blocks");
+        let early_capability_flags = blocks
+            .core
+            .optional_data
+            .early_capability_flags
+            .expect("early caps are always written");
+        assert!(early_capability_flags.contains(gcc::ClientEarlyCapabilityFlags::SUPPORT_DYN_VC_GFX_PROTOCOL));
+        assert!(early_capability_flags.contains(gcc::ClientEarlyCapabilityFlags::SUPPORT_NET_CHAR_AUTODETECT));
+
+        let config = test_config(false);
+        let blocks = create_gcc_blocks(&config, None, nego::SecurityProtocol::HYBRID_EX, false, core::iter::empty())
+            .expect("valid GCC blocks");
+        let early_capability_flags = blocks
+            .core
+            .optional_data
+            .early_capability_flags
+            .expect("early caps are always written");
+        assert!(!early_capability_flags.contains(gcc::ClientEarlyCapabilityFlags::SUPPORT_DYN_VC_GFX_PROTOCOL));
+    }
+
     /// The exact bytes captured from the failing connection (see
     /// `rdp/ironrdp-fork.md` in the Tessera repository): an Auto-Detect
     /// Request whose `BasicSecurityHeader.flags` are `0x1000`
@@ -2242,6 +2320,7 @@ mod tests {
             autologon: false,
             enable_audio_playback: false,
             enable_audio_capture: false,
+            enable_graphics_pipeline: false,
             performance_flags: Default::default(),
             license_cache: None,
             timezone_info: Default::default(),

@@ -1249,6 +1249,7 @@ mod tessera_guard2_tests {
             autologon: false,
             enable_audio_playback: false,
             enable_audio_capture: false,
+            enable_graphics_pipeline: false,
             license_cache: None,
             compression_type: None,
             enable_server_pointer: false,

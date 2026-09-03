@@ -1483,6 +1483,7 @@ fn build_config(
         autologon: false,
         enable_audio_playback: false,
         enable_audio_capture: false,
+        enable_graphics_pipeline: false,
         request_data: None,
         pointer_software_rendering: false,
         multitransport_flags: None,
