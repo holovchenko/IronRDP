@@ -10,7 +10,7 @@
 use ironrdp_graphics::image_processing::PixelFormat;
 use ironrdp_pdu::geometry::ExclusiveRectangle;
 use ironrdp_session::image::DecodedImage;
-use ironrdp_session::{apply_reset_graphics, composite_graphics_updates};
+use ironrdp_session::{MAX_GRAPHICS_OUTPUT_DIMENSION, apply_reset_graphics, composite_graphics_updates};
 
 fn update(left: u16, top: u16, right: u16, bottom: u16) -> (ExclusiveRectangle, Vec<u8>) {
     let w = usize::from(right - left);
@@ -149,7 +149,7 @@ fn a_delta_touching_the_image_edge_is_accepted() {
 fn apply_reset_graphics_resizes_the_image_to_the_declared_dimensions() {
     let mut image = DecodedImage::new(PixelFormat::RgbA32, 1, 1);
 
-    apply_reset_graphics(&mut image, 800, 600).unwrap();
+    apply_reset_graphics(&mut image, 800, 600, MAX_GRAPHICS_OUTPUT_DIMENSION).unwrap();
 
     assert_eq!(image.width(), 800);
     assert_eq!(image.height(), 600);
@@ -161,33 +161,57 @@ fn apply_reset_graphics_resizes_the_image_to_the_declared_dimensions() {
 fn apply_reset_graphics_rejects_zero_dimensions() {
     let mut image = DecodedImage::new(PixelFormat::RgbA32, 1, 1);
 
-    assert!(apply_reset_graphics(&mut image, 0, 600).is_err());
-    assert!(apply_reset_graphics(&mut image, 800, 0).is_err());
+    assert!(apply_reset_graphics(&mut image, 0, 600, MAX_GRAPHICS_OUTPUT_DIMENSION).is_err());
+    assert!(apply_reset_graphics(&mut image, 800, 0, MAX_GRAPHICS_OUTPUT_DIMENSION).is_err());
 }
 
 #[test]
 fn apply_reset_graphics_rejects_dimensions_past_the_spec_maximum() {
     let mut image = DecodedImage::new(PixelFormat::RgbA32, 1, 1);
 
-    assert!(apply_reset_graphics(&mut image, 32767, 600).is_err());
-    assert!(apply_reset_graphics(&mut image, 800, 32767).is_err());
-    assert!(apply_reset_graphics(&mut image, u32::MAX, 600).is_err());
-    assert!(apply_reset_graphics(&mut image, 800, u32::MAX).is_err());
+    assert!(apply_reset_graphics(&mut image, 32767, 600, MAX_GRAPHICS_OUTPUT_DIMENSION).is_err());
+    assert!(apply_reset_graphics(&mut image, 800, 32767, MAX_GRAPHICS_OUTPUT_DIMENSION).is_err());
+    assert!(apply_reset_graphics(&mut image, u32::MAX, 600, MAX_GRAPHICS_OUTPUT_DIMENSION).is_err());
+    assert!(apply_reset_graphics(&mut image, 800, u32::MAX, MAX_GRAPHICS_OUTPUT_DIMENSION).is_err());
 }
 
 #[test]
 fn apply_reset_graphics_accepts_the_exact_spec_maximum() {
     // 32766 on both axes is ~4.1 GiB of RGBA8888 and too heavy to allocate in a unit
     // test, so this pins the boundary on one axis at a time instead, with the other
-    // held small: it exercises the same `> MAX_GRAPHICS_DIMENSION` comparison a
-    // careless `>=` refactor would break, without the large allocation.
+    // held small: it exercises the same `> max` comparison a careless `>=` refactor
+    // would break, without the large allocation.
     let mut image = DecodedImage::new(PixelFormat::RgbA32, 1, 1);
-    apply_reset_graphics(&mut image, 32766, 1).unwrap();
+    apply_reset_graphics(&mut image, 32766, 1, MAX_GRAPHICS_OUTPUT_DIMENSION).unwrap();
     assert_eq!(image.width(), 32766);
     assert_eq!(image.height(), 1);
 
     let mut image = DecodedImage::new(PixelFormat::RgbA32, 1, 1);
-    apply_reset_graphics(&mut image, 1, 32766).unwrap();
+    apply_reset_graphics(&mut image, 1, 32766, MAX_GRAPHICS_OUTPUT_DIMENSION).unwrap();
     assert_eq!(image.width(), 1);
     assert_eq!(image.height(), 32766);
+}
+
+/// A client with a tighter framebuffer limit than the spec maximum (e.g. wgpu's
+/// `max_texture_dimension_2d` under `Limits::default()`) rejects a `ResetGraphics`
+/// past its own limit instead of allocating an image it cannot back with a texture.
+#[test]
+fn apply_reset_graphics_rejects_dimensions_past_a_client_supplied_maximum() {
+    let mut image = DecodedImage::new(PixelFormat::RgbA32, 1, 1);
+
+    assert!(apply_reset_graphics(&mut image, 8193, 600, 8192).is_err());
+    assert!(apply_reset_graphics(&mut image, 800, 8193, 8192).is_err());
+}
+
+#[test]
+fn apply_reset_graphics_accepts_the_exact_client_supplied_maximum() {
+    let mut image = DecodedImage::new(PixelFormat::RgbA32, 1, 1);
+    apply_reset_graphics(&mut image, 8192, 600, 8192).unwrap();
+    assert_eq!(image.width(), 8192);
+    assert_eq!(image.height(), 600);
+
+    let mut image = DecodedImage::new(PixelFormat::RgbA32, 1, 1);
+    apply_reset_graphics(&mut image, 800, 8192, 8192).unwrap();
+    assert_eq!(image.width(), 800);
+    assert_eq!(image.height(), 8192);
 }

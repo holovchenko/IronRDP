@@ -17,7 +17,7 @@ use core::fmt;
 
 pub use active_stage::{ActiveStage, ActiveStageBuilder, ActiveStageOutput, GracefulDisconnectReason};
 #[cfg(feature = "__test")]
-pub use active_stage::{apply_reset_graphics, composite_graphics_updates};
+pub use active_stage::{MAX_GRAPHICS_OUTPUT_DIMENSION, apply_reset_graphics, composite_graphics_updates};
 pub use fast_path::{BulkDecompressionErrorKind, FastPathBulkDecompressionFailure};
 
 pub type SessionResult<T> = Result<T, SessionError>;

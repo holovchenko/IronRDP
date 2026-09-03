@@ -46,6 +46,12 @@ pub struct ActiveStage {
     bulk_decompressor: Option<BulkCompressor>,
     enable_server_pointer: bool,
     window_support_level: Option<WindowSupportLevel>,
+    /// Largest `ResetGraphics` width/height this client will accept.
+    ///
+    /// Defaults to [`MAX_GRAPHICS_OUTPUT_DIMENSION`], the MS-RDPEGFX wire limit. See
+    /// [`ActiveStage::set_max_graphics_output_dimension`] to lower it to match the
+    /// client's own rendering surface limit.
+    max_graphics_output_dimension: u16,
 }
 
 /// Builder for [`ActiveStage`].
@@ -102,9 +108,14 @@ impl ActiveStageBuilder {
             bulk_decompressor: new_bulk_decompressor(compression_type),
             enable_server_pointer,
             window_support_level: None,
+            max_graphics_output_dimension: MAX_GRAPHICS_OUTPUT_DIMENSION,
         }
     }
 }
+
+/// Largest `width`/`height` MS-RDPEGFX 2.2.2.14 (RDPGFX_RESET_GRAPHICS_PDU) allows.
+#[cfg_attr(feature = "__test", visibility::make(pub))]
+const MAX_GRAPHICS_OUTPUT_DIMENSION: u16 = 32766;
 
 fn new_bulk_decompressor(compression_type: Option<CompressionType>) -> Option<BulkCompressor> {
     compression_type.map(|compression_type| BulkCompressor::new(to_bulk_compression_type(compression_type)))
@@ -113,6 +124,17 @@ fn new_bulk_decompressor(compression_type: Option<CompressionType>) -> Option<Bu
 impl ActiveStage {
     pub fn update_mouse_pos(&mut self, x: u16, y: u16) {
         self.fast_path_processor.update_mouse_pos(x, y);
+    }
+
+    /// Lowers the largest `ResetGraphics` width/height this client will accept.
+    ///
+    /// A client whose framebuffer has a tighter limit than the MS-RDPEGFX wire maximum
+    /// (e.g. wgpu's `max_texture_dimension_2d`, which is 8192 under `Limits::default()`)
+    /// should call this with that limit. A `ResetGraphics` PDU declaring dimensions past it
+    /// is then rejected outright, instead of the client allocating a framebuffer it cannot
+    /// back with a texture and failing later at texture creation.
+    pub fn set_max_graphics_output_dimension(&mut self, max: u16) {
+        self.max_graphics_output_dimension = max;
     }
 
     /// Returns whether a malformed Fast-Path bitmap was discarded and needs a full visual recovery.
@@ -222,6 +244,7 @@ impl ActiveStage {
                 // data only ever arrives over a DVC, which is X224-carried, so this stays
                 // out of the Action::FastPath arm rather than running on every fast-path
                 // frame (the highest-frequency path in a session).
+                let max_graphics_output_dimension = self.max_graphics_output_dimension;
                 let (reset, graphics_updates) = self
                     .get_dvc_mut::<GraphicsPipelineClient>()
                     .map(|mut gfx| {
@@ -230,7 +253,7 @@ impl ActiveStage {
                     })
                     .unwrap_or_default();
                 if let Some((width, height)) = reset {
-                    apply_reset_graphics(image, width, height)?;
+                    apply_reset_graphics(image, width, height, max_graphics_output_dimension)?;
                 }
                 if let Some(region) =
                     composite_graphics_updates(image, graphics_updates.into_iter().map(|u| (u.region, u.data)))?
@@ -840,28 +863,28 @@ fn process_slow_path_pointer(
 /// Resize `image` to the dimensions a `ResetGraphics` PDU declared.
 ///
 /// MS-RDPEGFX 2.2.2.14 (RDPGFX_RESET_GRAPHICS_PDU) carries `width`/`height` as `u32` on the
-/// wire but requires both to not exceed 32766. This must run before
+/// wire but requires both to not exceed 32766. `max` narrows that further to whatever the
+/// client can actually back (see [`ActiveStage::set_max_graphics_output_dimension`]); it
+/// defaults to [`MAX_GRAPHICS_OUTPUT_DIMENSION`], the spec maximum, so a client that never
+/// calls the setter sees no change in behavior. This must run before
 /// [`composite_graphics_updates`] on the same DVC packet: `ResetGraphics` and the deltas it
 /// makes valid are decoded together by [`GraphicsPipelineClient::process`], and compositing
 /// against the old image size would drop every delta outside the old bounds as out of range.
 #[cfg_attr(feature = "__test", visibility::make(pub))]
-fn apply_reset_graphics(image: &mut DecodedImage, width: u32, height: u32) -> SessionResult<()> {
-    const MAX_GRAPHICS_DIMENSION: u32 = 32766;
+fn apply_reset_graphics(image: &mut DecodedImage, width: u32, height: u32, max: u16) -> SessionResult<()> {
+    let max_dimension = u32::from(max);
 
-    if width == 0 || width > MAX_GRAPHICS_DIMENSION || height == 0 || height > MAX_GRAPHICS_DIMENSION {
+    if width == 0 || width > max_dimension || height == 0 || height > max_dimension {
         return Err(reason_err!(
             "apply_reset_graphics",
-            "ResetGraphics dimensions out of range: {width}x{height}"
+            "ResetGraphics dimensions out of range: {width}x{height} (max {max})"
         ));
     }
 
-    #[expect(
-        clippy::as_conversions,
-        reason = "width and height are bounded by MAX_GRAPHICS_DIMENSION above"
-    )]
+    #[expect(clippy::as_conversions, reason = "width and height are bounded by max above")]
     #[expect(
         clippy::cast_possible_truncation,
-        reason = "width and height are bounded by MAX_GRAPHICS_DIMENSION above"
+        reason = "width and height are bounded by max above"
     )]
     let (width, height) = (width as u16, height as u16);
     *image = DecodedImage::new(image.pixel_format(), width, height);
