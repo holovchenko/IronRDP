@@ -7,10 +7,30 @@
 //! modules there never run under `cargo test --workspace --locked`. These tests
 //! live here instead so they actually execute in CI.
 
+use std::any::TypeId;
+
+use ironrdp_core::encode_vec;
+use ironrdp_dvc::DrdynvcClient;
+use ironrdp_dvc::pdu::{CreateRequestPdu, DataPdu, DrdynvcDataPdu, DrdynvcServerPdu};
+use ironrdp_egfx::CHANNEL_NAME;
+use ironrdp_egfx::client::{BitmapUpdate, GraphicsPipelineClient, GraphicsPipelineHandler, Surface};
+use ironrdp_egfx::pdu::{
+    CapabilitySet, Color, CreateSurfacePdu, EndFramePdu, GfxPdu, MapSurfaceToOutputPdu, PixelFormat as GfxPixelFormat,
+    ResetGraphicsPdu, SolidFillPdu, StartFramePdu, Timestamp,
+};
 use ironrdp_graphics::image_processing::PixelFormat;
+use ironrdp_graphics::zgfx::wrap_uncompressed;
+use ironrdp_pdu::Action;
 use ironrdp_pdu::geometry::ExclusiveRectangle;
+use ironrdp_pdu::mcs::SendDataIndication;
+use ironrdp_pdu::rdp::vc::{ChannelControlFlags, ChannelPduHeader};
+use ironrdp_pdu::x224::X224;
 use ironrdp_session::image::DecodedImage;
-use ironrdp_session::{MAX_GRAPHICS_OUTPUT_DIMENSION, apply_reset_graphics, composite_graphics_updates};
+use ironrdp_session::{
+    ActiveStageBuilder, ActiveStageOutput, MAX_GRAPHICS_OUTPUT_DIMENSION, apply_reset_graphics,
+    composite_graphics_updates,
+};
+use ironrdp_svc::StaticChannelSet;
 
 fn update(left: u16, top: u16, right: u16, bottom: u16) -> (ExclusiveRectangle, Vec<u8>) {
     let w = usize::from(right - left);
@@ -251,4 +271,200 @@ fn apply_reset_graphics_still_validates_bounds_on_a_same_size_reset() {
     // width/height of 0 match the image's current (default) dimensions, but 0 is
     // rejected by the range check regardless.
     assert!(apply_reset_graphics(&mut image, 0, 0, MAX_GRAPHICS_OUTPUT_DIMENSION).is_err());
+}
+
+struct NoopGfxHandler;
+
+impl GraphicsPipelineHandler for NoopGfxHandler {
+    fn on_capabilities_confirmed(&mut self, _caps: &CapabilitySet) {}
+    fn on_reset_graphics(&mut self, _width: u32, _height: u32) {}
+    fn on_surface_created(&mut self, _surface: &Surface) {}
+    fn on_surface_deleted(&mut self, _surface_id: u16) {}
+    fn on_surface_mapped(&mut self, _surface_id: u16, _x: u32, _y: u32) {}
+    fn on_bitmap_updated(&mut self, _update: &BitmapUpdate) {}
+    fn on_frame_complete(&mut self, _frame_id: u32) {}
+    fn on_close(&mut self) {}
+    fn on_unhandled_pdu(&mut self, _pdu: &GfxPdu) {}
+}
+
+const USER_CHANNEL_ID: u16 = 1002;
+const IO_CHANNEL_ID: u16 = 1003;
+const DRDYNVC_CHANNEL_ID: u16 = 1004;
+const GFX_DVC_ID: u32 = 3;
+
+/// Wraps a drdynvc-encoded payload as a Virtual Channel PDU (MS-RDPBCGR 2.2.6.1) — a
+/// `ChannelPduHeader` naming the total length, followed by the data, with
+/// FLAG_FIRST | FLAG_LAST since this test never spans multiple chunks — then as an MCS
+/// Send Data Indication addressing the drdynvc static channel, the way a server frame
+/// addresses it.
+fn encode_drdynvc_packet(dvc_data: Vec<u8>) -> Vec<u8> {
+    let mut channel_pdu = encode_vec(&ChannelPduHeader {
+        length: u32::try_from(dvc_data.len()).expect("length fits in u32"),
+        flags: ChannelControlFlags::FLAG_FIRST | ChannelControlFlags::FLAG_LAST,
+    })
+    .expect("encode channel PDU header");
+    channel_pdu.extend_from_slice(&dvc_data);
+
+    let indication = SendDataIndication {
+        initiator_id: USER_CHANNEL_ID,
+        channel_id: DRDYNVC_CHANNEL_ID,
+        user_data: channel_pdu.into(),
+    };
+
+    encode_vec(&X224(indication)).expect("encode Send Data Indication")
+}
+
+/// Frames the DVC Create Request that opens the EGFX channel, the way a server does
+/// before sending any EGFX PDU.
+fn encode_egfx_create_packet() -> Vec<u8> {
+    let dvc_data = encode_vec(&DrdynvcServerPdu::Create(CreateRequestPdu::new(
+        GFX_DVC_ID,
+        CHANNEL_NAME.to_owned(),
+    )))
+    .expect("encode drdynvc create PDU");
+
+    encode_drdynvc_packet(dvc_data)
+}
+
+/// Frames a sequence of EGFX PDUs as a single drdynvc data message on the (already
+/// created) EGFX dynamic channel.
+fn encode_egfx_packet(pdus: &[GfxPdu]) -> Vec<u8> {
+    let mut raw = Vec::new();
+    for pdu in pdus {
+        raw.extend(encode_vec(pdu).expect("encode GFX PDU"));
+    }
+    let zgfx_payload = wrap_uncompressed(&raw);
+
+    let dvc_data = encode_vec(&DrdynvcServerPdu::Data(DrdynvcDataPdu::Data(DataPdu::new(
+        GFX_DVC_ID,
+        zgfx_payload,
+    ))))
+    .expect("encode drdynvc data PDU");
+
+    encode_drdynvc_packet(dvc_data)
+}
+
+/// This is the property `one_packet_yields_both_the_reset_size_and_a_full_surface_delta`
+/// (in `ironrdp-egfx`) cannot pin: that test reads `take_reset_graphics()` and
+/// `drain_output()` as two independent fields of `GraphicsPipelineClient`, so swapping
+/// the order `ActiveStage::process` consumes them in would not fail it. The actual
+/// invariant lives in `ActiveStage::process`: it must apply a drained `ResetGraphics`
+/// to `image` *before* compositing the drained graphics deltas, because a delta against
+/// the new (larger) surface is out of bounds for the still-old-sized `image` and gets
+/// silently dropped by `composite_graphics_updates`'s bounds check. This test drives a
+/// real `ActiveStage` end to end through a real `GraphicsPipelineClient` DVC to pin that
+/// ordering at the only level that can observe it.
+#[test]
+fn a_reset_and_its_repaint_in_one_packet_resize_the_image_before_compositing() {
+    const OLD_SIZE: u16 = 200;
+    const NEW_SIZE: u16 = 400;
+    const SURFACE_ID: u16 = 1;
+
+    let drdynvc =
+        DrdynvcClient::new().with_dynamic_channel(GraphicsPipelineClient::new(Box::new(NoopGfxHandler), None));
+
+    let mut static_channels = StaticChannelSet::new();
+    static_channels.insert(drdynvc);
+    static_channels.attach_channel_id(TypeId::of::<DrdynvcClient>(), DRDYNVC_CHANNEL_ID);
+
+    let mut active = ActiveStageBuilder {
+        static_channels,
+        user_channel_id: USER_CHANNEL_ID,
+        io_channel_id: IO_CHANNEL_ID,
+        message_channel_id: None,
+        share_id: 0,
+        compression_type: None,
+        enable_server_pointer: false,
+        pointer_software_rendering: false,
+    }
+    .build();
+
+    let mut image = DecodedImage::new(PixelFormat::RgbA32, OLD_SIZE, OLD_SIZE);
+
+    // Open the EGFX dynamic channel first, as a server does before sending any EGFX PDU.
+    active
+        .process(&mut image, Action::X224, &encode_egfx_create_packet())
+        .expect("the EGFX channel should open");
+
+    // A single server packet, as sent after a display resize: ResetGraphics to the new
+    // (larger) size, followed by a surface sized to match and a full-surface repaint —
+    // all decoded from one `process()` call.
+    let frame = encode_egfx_packet(&[
+        GfxPdu::ResetGraphics(ResetGraphicsPdu {
+            width: u32::from(NEW_SIZE),
+            height: u32::from(NEW_SIZE),
+            monitors: vec![],
+        }),
+        GfxPdu::CreateSurface(CreateSurfacePdu {
+            surface_id: SURFACE_ID,
+            width: NEW_SIZE,
+            height: NEW_SIZE,
+            pixel_format: GfxPixelFormat::XRgb,
+        }),
+        GfxPdu::MapSurfaceToOutput(MapSurfaceToOutputPdu {
+            surface_id: SURFACE_ID,
+            output_origin_x: 0,
+            output_origin_y: 0,
+        }),
+        GfxPdu::StartFrame(StartFramePdu {
+            timestamp: Timestamp {
+                milliseconds: 0,
+                seconds: 0,
+                minutes: 0,
+                hours: 0,
+            },
+            frame_id: 0,
+        }),
+        GfxPdu::SolidFill(SolidFillPdu {
+            surface_id: SURFACE_ID,
+            fill_pixel: Color {
+                b: 0,
+                g: 0,
+                r: 0,
+                xa: 0xFF,
+            },
+            rectangles: vec![ExclusiveRectangle {
+                left: 0,
+                top: 0,
+                right: NEW_SIZE,
+                bottom: NEW_SIZE,
+            }],
+        }),
+        GfxPdu::EndFrame(EndFramePdu { frame_id: 0 }),
+    ]);
+
+    let outputs = active
+        .process(&mut image, Action::X224, &frame)
+        .expect("processing the combined ResetGraphics + repaint packet should succeed");
+
+    assert_eq!(
+        image.width(),
+        NEW_SIZE,
+        "the image must be resized to the ResetGraphics dimensions"
+    );
+    assert_eq!(
+        image.height(),
+        NEW_SIZE,
+        "the image must be resized to the ResetGraphics dimensions"
+    );
+
+    let region = outputs
+        .iter()
+        .find_map(|output| match output {
+            ActiveStageOutput::GraphicsUpdate(region) => Some(region),
+            _ => None,
+        })
+        .expect(
+            "the full-surface repaint must reach the caller as a graphics update; if the reset were applied \
+             after compositing, the repaint would be out of bounds for the still-old-sized image and \
+             `composite_graphics_updates` would silently drop it, producing no `GraphicsUpdate` at all",
+        );
+
+    // Exclusive right/bottom of NEW_SIZE become inclusive NEW_SIZE - 1: this is the whole
+    // resized surface, not clipped to the old, smaller image.
+    assert_eq!(
+        (region.left, region.top, region.right, region.bottom),
+        (0, 0, NEW_SIZE - 1, NEW_SIZE - 1),
+        "the repaint region must cover the entire resized surface"
+    );
 }
