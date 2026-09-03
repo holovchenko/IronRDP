@@ -6,8 +6,9 @@ use ironrdp_pdu::rdp::vc::{ChannelControlFlags, ChannelPduHeader};
 use ironrdp_pdu::x224::X224;
 use ironrdp_session::{ActiveStageBuilder, x224::Processor};
 use ironrdp_svc::{
-    CHANNEL_CHUNK_LENGTH, MAX_CHANNEL_CHUNK_LENGTH, MAX_STATIC_CHANNELS, StaticChannelKey, StaticChannelSet,
-    StaticVirtualChannel, SvcClientProcessor, SvcMessage, SvcProcessor, SvcServerProcessor, make_channel_options,
+    CHANNEL_CHUNK_LENGTH, CompressionCondition, MAX_CHANNEL_CHUNK_LENGTH, MAX_STATIC_CHANNELS, StaticChannelKey,
+    StaticChannelSet, StaticVirtualChannel, SvcClientProcessor, SvcMessage, SvcProcessor, SvcServerProcessor,
+    make_channel_options,
 };
 
 #[derive(Debug)]
@@ -64,6 +65,31 @@ impl SvcProcessor for StartingRuntimeChannel {
 }
 
 impl SvcServerProcessor for StartingRuntimeChannel {}
+
+/// A processor that relies on the default `channel_options` implementation, only overriding
+/// `compression_condition`, to exercise `SvcProcessor::channel_options`'s default derivation.
+#[derive(Debug)]
+struct DefaultOptionsChannel {
+    compression_condition: CompressionCondition,
+}
+
+ironrdp_svc::impl_as_any!(DefaultOptionsChannel);
+
+impl SvcProcessor for DefaultOptionsChannel {
+    fn channel_name(&self) -> ChannelName {
+        ChannelName::from_utf8("defopts").expect("valid static channel name")
+    }
+
+    fn compression_condition(&self) -> CompressionCondition {
+        self.compression_condition
+    }
+
+    fn process(&mut self, _payload: &[u8]) -> ironrdp_pdu::PduResult<Vec<SvcMessage>> {
+        Ok(Vec::new())
+    }
+}
+
+impl SvcServerProcessor for DefaultOptionsChannel {}
 
 #[derive(Debug)]
 struct TypedChannel<const ID: usize>;
@@ -139,6 +165,25 @@ fn runtime_channels_have_independent_keys_options_and_ids() {
     assert_eq!(channels.get_channel_id_by_channel_name(&first_name), None);
     assert_eq!(channels.get_channel_id_by_channel_name(&second_name), Some(1005));
     assert_eq!(channels.get_key_by_channel_id(1005), Some(second));
+}
+
+#[test]
+fn default_channel_options_mark_the_channel_initialized() {
+    let never = DefaultOptionsChannel {
+        compression_condition: CompressionCondition::Never,
+    };
+    assert_eq!(
+        never.channel_options(),
+        ChannelOptions::INITIALIZED | ChannelOptions::ENCRYPT_RDP
+    );
+
+    let when_compressed = DefaultOptionsChannel {
+        compression_condition: CompressionCondition::WhenRdpDataIsCompressed,
+    };
+    assert_eq!(
+        when_compressed.channel_options(),
+        ChannelOptions::INITIALIZED | ChannelOptions::ENCRYPT_RDP | ChannelOptions::COMPRESS_RDP
+    );
 }
 
 #[test]

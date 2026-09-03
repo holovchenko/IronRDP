@@ -2199,6 +2199,46 @@ mod tests {
         assert_eq!(blocks.cluster, Some(cluster_data));
     }
 
+    #[derive(Debug)]
+    struct TrivialStaticChannel;
+
+    ironrdp_svc::impl_as_any!(TrivialStaticChannel);
+
+    impl ironrdp_svc::SvcProcessor for TrivialStaticChannel {
+        fn channel_name(&self) -> gcc::ChannelName {
+            gcc::ChannelName::from_utf8("trivial").expect("valid static channel name")
+        }
+
+        fn process(&mut self, _payload: &[u8]) -> ironrdp_pdu::PduResult<Vec<ironrdp_svc::SvcMessage>> {
+            Ok(Vec::new())
+        }
+    }
+
+    impl ironrdp_svc::SvcClientProcessor for TrivialStaticChannel {}
+
+    #[test]
+    fn advertised_static_channels_are_marked_initialized() {
+        let config = test_config(false);
+
+        let static_channel = ironrdp_svc::StaticVirtualChannel::new(TrivialStaticChannel);
+        let blocks = create_gcc_blocks(
+            &config,
+            None,
+            nego::SecurityProtocol::empty(),
+            true,
+            core::iter::once(&static_channel),
+        )
+        .expect("valid GCC Client Network Data");
+
+        let network = blocks.network.expect("static channel advertised");
+        assert_eq!(network.channels.len(), 1);
+        assert!(
+            network.channels[0]
+                .options
+                .contains(gcc::ChannelOptions::INITIALIZED | gcc::ChannelOptions::ENCRYPT_RDP)
+        );
+    }
+
     fn test_config(enable_graphics_pipeline: bool) -> Config {
         Config {
             desktop_size: DesktopSize {

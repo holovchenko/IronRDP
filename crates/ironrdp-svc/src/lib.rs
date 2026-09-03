@@ -290,13 +290,19 @@ pub trait SvcProcessor: AsAny + fmt::Debug + Send {
 
     /// Defines the channel options sent in the GCC Client Network Data block.
     ///
-    /// The default preserves the legacy compression-only configuration. Processors that need
-    /// additional static-channel options can override this method.
+    /// Per MS-RDPBCGR 2.2.1.3.4.1 (`CHANNEL_DEF`), the absence of `CHANNEL_OPTION_INITIALIZED`
+    /// indicates that the channel is a placeholder and the server MUST NOT set it up; the
+    /// section 4.1.3 Connect Initial example itself advertises `rdpsnd` with `0xC0000000`
+    /// (`INITIALIZED | ENCRYPT_RDP`), and FreeRDP sends `INITIALIZED | ENCRYPT_RDP` on every
+    /// static channel it advertises. `ENCRYPT_RDP` is inert once the connection is secured by
+    /// TLS/NLA, but it is what every shipping client sends, so the default reproduces it.
+    /// Processors that need additional static-channel options can override this method.
     fn channel_options(&self) -> ChannelOptions {
+        let base = ChannelOptions::INITIALIZED | ChannelOptions::ENCRYPT_RDP;
         match self.compression_condition() {
-            CompressionCondition::Never => ChannelOptions::empty(),
-            CompressionCondition::WhenRdpDataIsCompressed => ChannelOptions::COMPRESS_RDP,
-            CompressionCondition::Always => ChannelOptions::COMPRESS,
+            CompressionCondition::Never => base,
+            CompressionCondition::WhenRdpDataIsCompressed => base | ChannelOptions::COMPRESS_RDP,
+            CompressionCondition::Always => base | ChannelOptions::COMPRESS,
         }
     }
 
