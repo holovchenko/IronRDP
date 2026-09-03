@@ -133,6 +133,9 @@ impl ActiveStage {
     /// should call this with that limit. A `ResetGraphics` PDU declaring dimensions past it
     /// is then rejected outright, instead of the client allocating a framebuffer it cannot
     /// back with a texture and failing later at texture creation.
+    ///
+    /// `max` is taken as given: passing `0` leaves no width or height a server could
+    /// legally declare, so every later `ResetGraphics` fails. Pass a real limit.
     pub fn set_max_graphics_output_dimension(&mut self, max: u16) {
         self.max_graphics_output_dimension = max;
     }
