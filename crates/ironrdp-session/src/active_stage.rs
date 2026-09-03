@@ -887,6 +887,14 @@ fn apply_reset_graphics(image: &mut DecodedImage, width: u32, height: u32, max: 
         reason = "width and height are bounded by max above"
     )]
     let (width, height) = (width as u16, height as u16);
+
+    // The server repaints the recreated surface; keeping the old pixels avoids a blank
+    // flash and preserves the software-pointer state when the reset does not actually
+    // change the image dimensions (e.g. the server is only rebuilding its surfaces).
+    if (width, height) == (image.width(), image.height()) {
+        return Ok(());
+    }
+
     *image = DecodedImage::new(image.pixel_format(), width, height);
 
     Ok(())

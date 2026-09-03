@@ -215,3 +215,40 @@ fn apply_reset_graphics_accepts_the_exact_client_supplied_maximum() {
     assert_eq!(image.width(), 800);
     assert_eq!(image.height(), 8192);
 }
+
+/// A `ResetGraphics` declaring the image's current dimensions must leave the pixels
+/// untouched: the server can send `ResetGraphics` to rebuild its own surfaces without
+/// the client's framebuffer changing size, and rebuilding the image in that case would
+/// paint a visible blank flash and drop the software-pointer state for no reason.
+#[test]
+fn apply_reset_graphics_preserves_pixels_on_a_same_size_reset() {
+    let mut image = DecodedImage::new(PixelFormat::RgbA32, 4, 4);
+    composite_graphics_updates(&mut image, [update(0, 0, 4, 4)])
+        .expect("the update covers the whole image")
+        .expect("a full-image update produces a region");
+    let painted = image.data().to_vec();
+    assert!(
+        painted.iter().any(|&byte| byte != 0),
+        "the update must have painted something"
+    );
+
+    apply_reset_graphics(&mut image, 4, 4, MAX_GRAPHICS_OUTPUT_DIMENSION).unwrap();
+
+    assert_eq!(image.width(), 4);
+    assert_eq!(image.height(), 4);
+    assert_eq!(
+        image.data(),
+        painted.as_slice(),
+        "a same-size reset must not touch the pixels"
+    );
+}
+
+/// Bounds validation runs before the same-size guard: a reset whose declared size
+/// matches the image but is itself out of range must still be rejected.
+#[test]
+fn apply_reset_graphics_still_validates_bounds_on_a_same_size_reset() {
+    let mut image = DecodedImage::new(PixelFormat::RgbA32, 0, 0);
+    // width/height of 0 match the image's current (default) dimensions, but 0 is
+    // rejected by the range check regardless.
+    assert!(apply_reset_graphics(&mut image, 0, 0, MAX_GRAPHICS_OUTPUT_DIMENSION).is_err());
+}
