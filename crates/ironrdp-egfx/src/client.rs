@@ -853,19 +853,28 @@ impl GraphicsPipelineClient {
             .ok_or_else(|| pdu_other_err!("unknown surface in WireToSurface2"))?;
         let (surface_width, surface_height) = (surface.width, surface.height);
 
-        let tiles = self
-            .progressive_decoder
-            .decode_bitmap(
-                pdu.surface_id,
-                pdu.codec_context_id,
-                surface_width,
-                surface_height,
-                &pdu.bitmap_data,
-            )
-            .map_err(|error| {
-                warn!(?error, "rfx progressive decode failed");
-                pdu_other_err!("rfx progressive decode failed")
-            })?;
+        let tiles = match self.progressive_decoder.decode_bitmap(
+            pdu.surface_id,
+            pdu.codec_context_id,
+            surface_width,
+            surface_height,
+            &pdu.bitmap_data,
+        ) {
+            Ok(tiles) => tiles,
+            Err(error) => {
+                // The decoder leaves TileState untouched on error, so the surface stays
+                // at its prior state and the next frame that touches this region repaints
+                // it. Ending the session over one bad tile would be worse than a stale
+                // region and would just get replayed by the reconnect.
+                warn!(
+                    ?error,
+                    surface_id = pdu.surface_id,
+                    codec_context_id = pdu.codec_context_id,
+                    "rfx progressive decode failed; skipping this WireToSurface2 PDU"
+                );
+                return Ok(());
+            }
+        };
 
         for tile in tiles {
             let tile_left = tile.x_idx.saturating_mul(TILE_DIM);
@@ -1835,6 +1844,16 @@ mod tests {
     }
 
     fn progressive_tile_stream(tile_x: u16, tile_y: u16, rect_width: u16, rect_height: u16) -> Vec<u8> {
+        progressive_tile_stream_with_context(tile_x, tile_y, rect_width, rect_height, true)
+    }
+
+    fn progressive_tile_stream_with_context(
+        tile_x: u16,
+        tile_y: u16,
+        rect_width: u16,
+        rect_height: u16,
+        with_context: bool,
+    ) -> Vec<u8> {
         use ironrdp_graphics::progressive::{COEFFICIENTS_PER_COMPONENT, encode_first_pass};
         use ironrdp_pdu::codecs::rfx::RfxRectangle;
         use ironrdp_pdu::codecs::rfx::progressive::{
@@ -1856,44 +1875,46 @@ mod tests {
         .unwrap();
         let component_data = &component_data[..component_len];
 
-        encode_progressive_stream(&[
-            ProgressiveBlock::Sync(ProgressiveSyncPdu),
-            ProgressiveBlock::Context(ProgressiveContextPdu {
+        let mut blocks = Vec::new();
+        if with_context {
+            blocks.push(ProgressiveBlock::Sync(ProgressiveSyncPdu));
+            blocks.push(ProgressiveBlock::Context(ProgressiveContextPdu {
                 context_id: 0,
                 tile_size: 0x0040,
                 flags: 0,
-            }),
-            ProgressiveBlock::FrameBegin(ProgressiveFrameBeginPdu {
-                frame_index: 0,
-                region_count: 1,
-            }),
-            ProgressiveBlock::Region(ProgressiveRegion {
-                tile_size: 0x40,
-                rects: vec![RfxRectangle {
-                    x: tile_x.saturating_mul(64),
-                    y: tile_y.saturating_mul(64),
-                    width: rect_width,
-                    height: rect_height,
-                }],
-                quant_vals: vec![base_quant],
-                quant_prog_vals: vec![],
+            }));
+        }
+        blocks.push(ProgressiveBlock::FrameBegin(ProgressiveFrameBeginPdu {
+            frame_index: 0,
+            region_count: 1,
+        }));
+        blocks.push(ProgressiveBlock::Region(ProgressiveRegion {
+            tile_size: 0x40,
+            rects: vec![RfxRectangle {
+                x: tile_x.saturating_mul(64),
+                y: tile_y.saturating_mul(64),
+                width: rect_width,
+                height: rect_height,
+            }],
+            quant_vals: vec![base_quant],
+            quant_prog_vals: vec![],
+            flags: 0,
+            tiles: vec![ProgressiveTile::Simple(TileSimple {
+                quant_idx_y: 0,
+                quant_idx_cb: 0,
+                quant_idx_cr: 0,
+                x_idx: tile_x,
+                y_idx: tile_y,
                 flags: 0,
-                tiles: vec![ProgressiveTile::Simple(TileSimple {
-                    quant_idx_y: 0,
-                    quant_idx_cb: 0,
-                    quant_idx_cr: 0,
-                    x_idx: tile_x,
-                    y_idx: tile_y,
-                    flags: 0,
-                    y_data: component_data,
-                    cb_data: component_data,
-                    cr_data: component_data,
-                    tail_data: &[],
-                })],
-            }),
-            ProgressiveBlock::FrameEnd(ProgressiveFrameEndPdu),
-        ])
-        .unwrap()
+                y_data: component_data,
+                cb_data: component_data,
+                cr_data: component_data,
+                tail_data: &[],
+            })],
+        }));
+        blocks.push(ProgressiveBlock::FrameEnd(ProgressiveFrameEndPdu));
+
+        encode_progressive_stream(&blocks).unwrap()
     }
 
     #[test]
@@ -2140,10 +2161,43 @@ mod tests {
     }
 
     fn assert_progressive_context_is_deleted(clear: impl FnOnce(&mut GraphicsPipelineClient)) {
-        let mut client = progressive_client();
+        let updates = Arc::new(Mutex::new(Vec::new()));
+        let unhandled = Arc::new(Mutex::new(0));
+        let mut client = GraphicsPipelineClient::new(
+            Box::new(CapturingHandler {
+                updates: Arc::clone(&updates),
+                unhandled,
+            }),
+            None,
+        );
+        client
+            .handle_pdu(GfxPdu::ResetGraphics(crate::pdu::ResetGraphicsPdu {
+                width: 64,
+                height: 64,
+                monitors: vec![],
+            }))
+            .unwrap();
+        client
+            .handle_pdu(GfxPdu::CreateSurface(crate::pdu::CreateSurfacePdu {
+                surface_id: 1,
+                width: 64,
+                height: 64,
+                pixel_format: PixelFormat::XRgb,
+            }))
+            .unwrap();
+
         wire_progressive(&mut client, progressive_context_stream(true)).unwrap();
         clear(&mut client);
-        assert!(wire_progressive(&mut client, progressive_context_stream(false)).is_err());
+
+        // The codec context no longer exists, so decoding the context-less continuation
+        // fails; a failed WireToSurface2 PDU is now skipped rather than ending the
+        // session, so the call still returns Ok with no bitmap update delivered.
+        assert!(
+            wire_progressive(&mut client, progressive_tile_stream_with_context(0, 0, 64, 64, false))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(updates.lock().expect("updates lock").is_empty());
     }
 
     #[test]
@@ -2204,5 +2258,38 @@ mod tests {
                 }))
                 .unwrap();
         });
+    }
+
+    #[test]
+    fn wire_to_surface2_with_a_malformed_progressive_payload_is_skipped_not_fatal() {
+        let mut client = GraphicsPipelineClient::new(Box::new(TestHandler), None);
+        client
+            .handle_pdu(GfxPdu::CapabilitiesConfirm(
+                crate::pdu::CapabilitiesConfirmPdu::from_typed(&CapabilitySet::V8 {
+                    flags: CapabilitiesV8Flags::empty(),
+                }),
+            ))
+            .unwrap();
+        client
+            .handle_pdu(GfxPdu::CreateSurface(crate::pdu::CreateSurfacePdu {
+                surface_id: 1,
+                width: 64,
+                height: 64,
+                pixel_format: PixelFormat::XRgb,
+            }))
+            .unwrap();
+
+        // Garbage bytes with no SYNC/CONTEXT/FRAME_BEGIN block header: decode_bitmap
+        // fails to parse a progressive block at all.
+        let result = client.handle_pdu(GfxPdu::WireToSurface2(WireToSurface2Pdu {
+            surface_id: 1,
+            codec_id: crate::pdu::Codec2Type::RemoteFxProgressive,
+            codec_context_id: 7,
+            pixel_format: PixelFormat::XRgb,
+            bitmap_data: vec![0xFF, 0xFF, 0xFF, 0xFF],
+        }));
+
+        assert!(result.unwrap().is_empty());
+        assert!(client.is_active());
     }
 }
