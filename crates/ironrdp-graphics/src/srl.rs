@@ -6,6 +6,10 @@
 //!
 //! Reading past the end of the stream yields zero bits rather than an error:
 //! see [`BitReader`] for why that matches the reference decoder and is safe.
+//!
+//! Zero runs saturate at [`MAX_ZERO_RUN`] instead of erroring, for the same reason:
+//! a run that long simply means the rest of the component is zero. `SrlError::ZeroRunTooLong`
+//! is raised only by [`SrlEncoder`], which cannot represent a longer run on the wire.
 
 const INITIAL_KP: u8 = 8;
 const MAX_KP: u8 = 80;
@@ -19,7 +23,12 @@ pub enum SrlError {
     InvalidBitCount(u8),
     /// A value cannot be represented by the magnitude width.
     MagnitudeOutOfRange { magnitude: u16, max: u16 },
-    /// A zero run exceeds the number of coefficients in one component.
+    /// An encoder tried to write a zero run longer than a component can hold.
+    ///
+    /// The decoder never returns this: a zero run longer than the coefficients
+    /// requested simply means the rest of the component is zero, matching
+    /// FreeRDP's unbounded `progressive_rfx_srl_read`. It is an encoder-side
+    /// error only, produced by [`SrlEncoder::encode`].
     ZeroRunTooLong,
 }
 
@@ -84,14 +93,21 @@ impl<'a> SrlDecoder<'a> {
                 continue;
             }
 
-            self.zero_run_remaining = self.decode_zero_run()?;
+            self.zero_run_remaining = self.decode_zero_run();
             self.nonzero_pending = true;
         }
 
         Ok(output)
     }
 
-    fn decode_zero_run(&mut self) -> Result<usize, SrlError> {
+    // This never fails: a zero run longer than any plausible request means "everything
+    // else is zero," never a malformed stream, matching FreeRDP's progressive_rfx_srl_read
+    // (whose `nz` accumulator has no bound; the fixed per-band coefficient counts stop
+    // decoding on their own). Real encoders pad the SRL stream with trailing zero bytes
+    // per MS-RDPEGFX 3.1.8.1.5, and a Windows 11 server emits more than the mandated one,
+    // so a run's chunk sum can pass MAX_ZERO_RUN on padding alone; saturating here instead
+    // of erroring keeps that tile from being skipped.
+    fn decode_zero_run(&mut self) -> usize {
         let mut zeros = 0usize;
 
         loop {
@@ -103,21 +119,20 @@ impl<'a> SrlDecoder<'a> {
             // (per-band coefficient counts stay well under MAX_ZERO_RUN) instead of
             // erroring, matching the "decode as zeros past the end" contract.
             if self.reader.at_end() {
-                return Ok(MAX_ZERO_RUN);
+                return MAX_ZERO_RUN;
             }
 
             if self.reader.read_bit() {
-                let tail = usize::try_from(self.reader.read_bits(k)).map_err(|_| SrlError::ZeroRunTooLong)?;
+                let tail = usize::try_from(self.reader.read_bits(k)).unwrap_or(usize::MAX);
                 self.kp = self.kp.saturating_sub(6);
 
-                let zeros = zeros.checked_add(tail).ok_or(SrlError::ZeroRunTooLong)?;
-                return (zeros <= MAX_ZERO_RUN).then_some(zeros).ok_or(SrlError::ZeroRunTooLong);
+                return zeros.saturating_add(tail).min(MAX_ZERO_RUN);
             }
 
             let chunk = 1usize << k;
-            zeros = zeros.checked_add(chunk).ok_or(SrlError::ZeroRunTooLong)?;
-            if zeros > MAX_ZERO_RUN {
-                return Err(SrlError::ZeroRunTooLong);
+            zeros = zeros.saturating_add(chunk).min(MAX_ZERO_RUN);
+            if zeros >= MAX_ZERO_RUN {
+                return MAX_ZERO_RUN;
             }
 
             self.kp = self.kp.saturating_add(4).min(MAX_KP);
@@ -409,6 +424,22 @@ mod tests {
     fn an_empty_stream_decodes_as_zeros() {
         assert_eq!(decode_srl(&[], 0, 4), Ok(vec![]));
         assert_eq!(decode_srl(&[], 3, 4), Ok(vec![0, 0, 0]));
+    }
+
+    #[test]
+    fn padding_zero_bytes_decode_as_zeros_not_an_error() {
+        // Zero run 0 (10), positive sign (0), magnitude 3 (001), then four trailing
+        // zero bytes: real encoders pad past the mandated one, and their "0" bits sum
+        // past MAX_ZERO_RUN before the coefficient count is reached.
+        assert_eq!(
+            decode_srl(&[0x84, 0x00, 0x00, 0x00, 0x00], 5, 4),
+            Ok(vec![3, 0, 0, 0, 0])
+        );
+    }
+
+    #[test]
+    fn a_zero_run_longer_than_the_request_saturates() {
+        assert_eq!(decode_srl(&[0x00; 8], 10, 4), Ok(vec![0; 10]));
     }
 
     #[test]

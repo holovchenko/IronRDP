@@ -2094,34 +2094,39 @@ mod tests {
 
     #[test]
     fn tile_upgrade_keeps_all_components_on_srl_error() {
-        // The first component's SRL data decodes fine; the second's is a long real run
-        // of zero bits (not stream padding) that exceeds MAX_ZERO_RUN and still errors,
-        // so the malformed-stream bound still applies while real data remains.
+        // The first component's SRL data decodes fine. A long real run of zero bits used
+        // to exceed MAX_ZERO_RUN and error there, but the decoder now saturates that run
+        // instead (it means "everything else is zero," matching FreeRDP). So the second
+        // component here instead carries an invalid 16-bit HL1 magnitude width -- the
+        // only decoder error left reachable from a TILE_UPGRADE -- and the state must
+        // still be left untouched.
         let mut tile = TileState::new();
         let mut prev_prog_quant = ComponentCodecQuant::LOSSLESS;
         prev_prog_quant.hl1 = 4;
         tile.prog_quant = [prev_prog_quant; 3];
+        tile.prog_quant[1].hl1 = 16;
         tile.pass = 1;
         tile.quality = 50;
         tile.sign[0][0] = SIGN_ZERO;
         tile.sign[1][0] = SIGN_ZERO;
 
+        let prog_quant = tile.prog_quant;
         let coefficients = tile.coefficients;
         let sign = tile.sign;
 
         assert_eq!(
             tile.decode_upgrade(
-                [&[0x90, 0x00], &[0x00, 0x00, 0x00], &[]],
+                [&[0x90, 0x00], &[0x80], &[]],
                 [&[], &[], &[]],
                 [ComponentCodecQuant::LOSSLESS; 3],
                 75,
             ),
-            Err(SrlError::ZeroRunTooLong)
+            Err(SrlError::InvalidBitCount(16))
         );
 
         assert_eq!(tile.coefficients, coefficients);
         assert_eq!(tile.sign, sign);
-        assert_eq!(tile.prog_quant, [prev_prog_quant; 3]);
+        assert_eq!(tile.prog_quant, prog_quant);
         assert_eq!(tile.pass, 1);
         assert_eq!(tile.quality, 50);
     }
