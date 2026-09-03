@@ -2065,7 +2065,11 @@ mod tests {
     }
 
     #[test]
-    fn upgrade_pass_rejects_truncated_srl() {
+    fn upgrade_pass_decodes_srl_as_zero_past_the_end_of_the_stream() {
+        // srl_data has only enough real bits for the zero-run terminator and the sign
+        // bit; the magnitude's unary zero-count then runs off the end of the stream and
+        // reads as zero, per MS-RDPEGFX 3.1.8.1.5's uncoded trailing run. It stops at
+        // the band's num_bits=4 ceiling (magnitude 15) rather than erroring.
         let mut coefficients = [0i16; COEFFICIENTS_PER_COMPONENT];
         let mut sign = [SIGN_POSITIVE; COEFFICIENTS_PER_COMPONENT];
         sign[0] = SIGN_ZERO;
@@ -2073,22 +2077,26 @@ mod tests {
         let mut prev_prog_quant = ComponentCodecQuant::LOSSLESS;
         prev_prog_quant.hl1 = 4;
 
-        assert_eq!(
-            decode_upgrade_pass(
-                &[0x80, 0x00],
-                &[],
-                &prev_prog_quant,
-                &ComponentCodecQuant::LOSSLESS,
-                false,
-                &mut coefficients,
-                &mut sign,
-            ),
-            Err(SrlError::Truncated)
-        );
+        decode_upgrade_pass(
+            &[0x80, 0x00],
+            &[],
+            &prev_prog_quant,
+            &ComponentCodecQuant::LOSSLESS,
+            false,
+            &mut coefficients,
+            &mut sign,
+        )
+        .unwrap();
+
+        assert_eq!(coefficients[0], 15);
+        assert_eq!(sign[0], SIGN_POSITIVE);
     }
 
     #[test]
     fn tile_upgrade_keeps_all_components_on_srl_error() {
+        // The first component's SRL data decodes fine; the second's is a long real run
+        // of zero bits (not stream padding) that exceeds MAX_ZERO_RUN and still errors,
+        // so the malformed-stream bound still applies while real data remains.
         let mut tile = TileState::new();
         let mut prev_prog_quant = ComponentCodecQuant::LOSSLESS;
         prev_prog_quant.hl1 = 4;
@@ -2103,12 +2111,12 @@ mod tests {
 
         assert_eq!(
             tile.decode_upgrade(
-                [&[0x90, 0x00], &[0x80, 0x00], &[]],
+                [&[0x90, 0x00], &[0x00, 0x00, 0x00], &[]],
                 [&[], &[], &[]],
                 [ComponentCodecQuant::LOSSLESS; 3],
                 75,
             ),
-            Err(SrlError::Truncated)
+            Err(SrlError::ZeroRunTooLong)
         );
 
         assert_eq!(tile.coefficients, coefficients);

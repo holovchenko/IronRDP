@@ -3,6 +3,9 @@
 //! SRL is a stateful bit stream for each component of a TILE_UPGRADE.
 //! Its zero runs and adaptive `KP` state continue across DWT bands.
 //! See MS-RDPEGFX sections 3.1.8.1.5 through 3.1.8.1.5.2.
+//!
+//! Reading past the end of the stream yields zero bits rather than an error:
+//! see [`BitReader`] for why that matches the reference decoder and is safe.
 
 const INITIAL_KP: u8 = 8;
 const MAX_KP: u8 = 80;
@@ -12,8 +15,6 @@ const MAX_ZERO_RUN: usize = 4096;
 /// Errors encountered while decoding or encoding an SRL stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SrlError {
-    /// The stream ended before a complete code word was read.
-    Truncated,
     /// An SRL value requires between one and fifteen magnitude bits.
     InvalidBitCount(u8),
     /// A value cannot be represented by the magnitude width.
@@ -25,7 +26,6 @@ pub enum SrlError {
 impl core::fmt::Display for SrlError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            Self::Truncated => write!(f, "srl stream is truncated"),
             Self::InvalidBitCount(bits) => write!(f, "invalid srl magnitude bit count {bits}"),
             Self::MagnitudeOutOfRange { magnitude, max } => {
                 write!(f, "srl magnitude {magnitude} exceeds maximum {max}")
@@ -97,8 +97,17 @@ impl<'a> SrlDecoder<'a> {
         loop {
             let k = self.kp / 8;
 
-            if self.reader.read_bit()? {
-                let tail = usize::try_from(self.reader.read_bits(k)?).map_err(|_| SrlError::ZeroRunTooLong)?;
+            // Once the real stream is exhausted, every further bit reads as zero and the
+            // zero-run code word never terminates: nothing was coded for it. Stop growing
+            // it and hand back a run long enough to cover any plausible remaining request
+            // (per-band coefficient counts stay well under MAX_ZERO_RUN) instead of
+            // erroring, matching the "decode as zeros past the end" contract.
+            if self.reader.at_end() {
+                return Ok(MAX_ZERO_RUN);
+            }
+
+            if self.reader.read_bit() {
+                let tail = usize::try_from(self.reader.read_bits(k)).map_err(|_| SrlError::ZeroRunTooLong)?;
                 self.kp = self.kp.saturating_sub(6);
 
                 let zeros = zeros.checked_add(tail).ok_or(SrlError::ZeroRunTooLong)?;
@@ -117,11 +126,11 @@ impl<'a> SrlDecoder<'a> {
 
     fn decode_nonzero(&mut self, num_bits: u8) -> Result<i16, SrlError> {
         let maximum = max_magnitude(num_bits)?;
-        let sign = self.reader.read_bit()?;
+        let sign = self.reader.read_bit();
         let mut zero_count = 0u16;
 
         while zero_count + 1 < maximum {
-            if self.reader.read_bit()? {
+            if self.reader.read_bit() {
                 break;
             }
 
@@ -255,6 +264,17 @@ fn max_magnitude(num_bits: u8) -> Result<u16, SrlError> {
     Ok((1u16 << num_bits) - 1)
 }
 
+/// Reads bits from an SRL byte stream, one at a time, most-significant-bit first.
+///
+/// Bits past the end of `data` read as zero instead of erroring. This matches the
+/// reference decoder (FreeRDP's `progressive_rfx_srl_read` over `wBitStream`), which
+/// reads zero bits past `srlLen`. It is also correct: an encoder never codes the
+/// trailing run of zero coefficients at the end of a component, since nothing follows
+/// the last nonzero value, and the fixed per-band coefficient counts (1023/1023/961/
+/// 272/272/256/72/72/64/81) end decoding regardless of how many bits were consumed. So
+/// a well-formed stream never needs a bit past its end, and reading zeros there decodes
+/// exactly the uncoded trailing zero run. A malformed stream simply decodes as zeros
+/// past that point rather than erroring; [`MAX_ZERO_RUN`] still bounds it.
 struct BitReader<'a> {
     data: &'a [u8],
     byte_idx: usize,
@@ -270,9 +290,14 @@ impl<'a> BitReader<'a> {
         }
     }
 
-    fn read_bit(&mut self) -> Result<bool, SrlError> {
+    /// Whether the reader has consumed every real byte, so every further `read_bit` is padding.
+    fn at_end(&self) -> bool {
+        self.byte_idx >= self.data.len()
+    }
+
+    fn read_bit(&mut self) -> bool {
         let Some(&byte) = self.data.get(self.byte_idx) else {
-            return Err(SrlError::Truncated);
+            return false;
         };
 
         let bit = (byte >> (7 - self.bit_idx)) & 1 != 0;
@@ -282,15 +307,15 @@ impl<'a> BitReader<'a> {
             self.byte_idx += 1;
         }
 
-        Ok(bit)
+        bit
     }
 
-    fn read_bits(&mut self, count: u8) -> Result<u32, SrlError> {
+    fn read_bits(&mut self, count: u8) -> u32 {
         let mut value = 0u32;
         for _ in 0..count {
-            value = (value << 1) | u32::from(self.read_bit()?);
+            value = (value << 1) | u32::from(self.read_bit());
         }
-        Ok(value)
+        value
     }
 }
 
@@ -362,8 +387,10 @@ mod tests {
     }
 
     #[test]
-    fn rejects_truncated_stream() {
-        assert_eq!(decode_srl(&[0x80, 0x00], 1, 4), Err(SrlError::Truncated));
+    fn reads_zero_bits_past_the_end_of_the_stream() {
+        // Zero run 0 (10), positive sign (0), magnitude 3 (001); the four trailing
+        // zeros are never coded, as a Windows encoder leaves them uncoded.
+        assert_eq!(decode_srl(&[0x84], 5, 4), Ok(vec![3, 0, 0, 0, 0]));
     }
 
     #[test]
@@ -379,9 +406,9 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_stream_yields_no_values_and_truncates_on_demand() {
+    fn an_empty_stream_decodes_as_zeros() {
         assert_eq!(decode_srl(&[], 0, 4), Ok(vec![]));
-        assert_eq!(decode_srl(&[], 1, 4), Err(SrlError::Truncated));
+        assert_eq!(decode_srl(&[], 3, 4), Ok(vec![0, 0, 0]));
     }
 
     #[test]
