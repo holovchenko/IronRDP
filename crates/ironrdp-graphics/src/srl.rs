@@ -12,8 +12,6 @@ const MAX_ZERO_RUN: usize = 4096;
 /// Errors encountered while decoding or encoding an SRL stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SrlError {
-    /// The required trailing zero byte is absent.
-    MissingTerminator,
     /// The stream ended before a complete code word was read.
     Truncated,
     /// An SRL value requires between one and fifteen magnitude bits.
@@ -27,7 +25,6 @@ pub enum SrlError {
 impl core::fmt::Display for SrlError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            Self::MissingTerminator => write!(f, "srl stream is missing its trailing zero byte"),
             Self::Truncated => write!(f, "srl stream is truncated"),
             Self::InvalidBitCount(bits) => write!(f, "invalid srl magnitude bit count {bits}"),
             Self::MagnitudeOutOfRange { magnitude, max } => {
@@ -52,22 +49,19 @@ pub struct SrlDecoder<'a> {
 }
 
 impl<'a> SrlDecoder<'a> {
-    /// Create a decoder for an SRL stream, excluding its required trailing zero byte.
-    pub fn new(data: &'a [u8]) -> Result<Self, SrlError> {
-        let Some((&terminator, payload)) = data.split_last() else {
-            return Err(SrlError::MissingTerminator);
-        };
-
-        if terminator != 0 {
-            return Err(SrlError::MissingTerminator);
-        }
-
-        Ok(Self {
-            reader: BitReader::new(payload),
+    /// Create a decoder for an SRL stream.
+    ///
+    /// The decoder reads `data` as the bit stream and stops once it has produced the
+    /// requested coefficient counts, per the fixed per-band counts driving [`Self::decode`].
+    /// Encoders emit an extra trailing zero byte per MS-RDPEGFX 3.1.8.1.5, but Windows
+    /// servers do not count that byte into `*SrlLen`, so it is simply never reached here.
+    pub fn new(data: &'a [u8]) -> Self {
+        Self {
+            reader: BitReader::new(data),
             kp: INITIAL_KP,
             zero_run_remaining: 0,
             nonzero_pending: false,
-        })
+        }
     }
 
     /// Decode `num_values` entries for one DWT band.
@@ -238,7 +232,7 @@ impl Default for SrlEncoder {
 /// magnitude width. Progressive tile decoding should use [`SrlDecoder`]
 /// directly so its state continues between bands.
 pub fn decode_srl(data: &[u8], num_values: usize, num_bits: u8) -> Result<Vec<i16>, SrlError> {
-    let mut decoder = SrlDecoder::new(data)?;
+    let mut decoder = SrlDecoder::new(data);
     decoder.decode(num_values, num_bits)
 }
 
@@ -355,7 +349,7 @@ mod tests {
     fn preserves_zero_run_and_kp_between_bands() {
         // A two-zero run (010) spans the first and second calls.
         // The following positive magnitude-one value uses K=0 after the run.
-        let mut decoder = SrlDecoder::new(&[0x48, 0x00]).unwrap();
+        let mut decoder = SrlDecoder::new(&[0x48, 0x00]);
         assert_eq!(decoder.decode(1, 4), Ok(vec![0]));
         assert_eq!(decoder.decode(2, 4), Ok(vec![0, 1]));
     }
@@ -373,8 +367,21 @@ mod tests {
     }
 
     #[test]
-    fn rejects_missing_terminator() {
-        assert_eq!(decode_srl(&[0x84], 1, 4), Err(SrlError::MissingTerminator));
+    fn decodes_a_stream_that_has_no_trailing_zero_byte() {
+        // The byte holds zero run 0 (1, K=1 -> 10), positive sign (0), magnitude 3 (001)
+        // and nothing else -- the layout Windows sends when ySrlLen counts only data bytes.
+        assert_eq!(decode_srl(&[0x84], 1, 4), Ok(vec![3]));
+    }
+
+    #[test]
+    fn ignores_a_trailing_zero_byte_when_present() {
+        assert_eq!(decode_srl(&[0x84, 0x00], 1, 4), Ok(vec![3]));
+    }
+
+    #[test]
+    fn an_empty_stream_yields_no_values_and_truncates_on_demand() {
+        assert_eq!(decode_srl(&[], 0, 4), Ok(vec![]));
+        assert_eq!(decode_srl(&[], 1, 4), Err(SrlError::Truncated));
     }
 
     #[test]
@@ -400,7 +407,7 @@ mod tests {
         let original = [0, 0, 1, -1, 0, 3];
         let encoded = encode_srl(&original, 4).unwrap();
         assert_eq!(encoded, vec![0x4F, 0x44, 0x00]);
-        let mut decoder = SrlDecoder::new(&encoded).unwrap();
+        let mut decoder = SrlDecoder::new(&encoded);
         assert_eq!(decoder.decode(2, 4), Ok(vec![0, 0]));
         assert_eq!(decoder.decode(1, 4), Ok(vec![1]));
         assert_eq!(decoder.decode(1, 4), Ok(vec![-1]));

@@ -187,7 +187,7 @@ pub fn decode_upgrade_pass(
             .saturating_sub(curr_prog_quant.for_band(band_idx));
         band_idx != NUM_BANDS - 1 && num_bits != 0 && zero_counts[band_idx] != 0
     });
-    let mut srl_decoder = has_srl_values.then(|| srl::SrlDecoder::new(srl_data)).transpose()?;
+    let mut srl_decoder = has_srl_values.then(|| srl::SrlDecoder::new(srl_data));
     let mut srl_values = Vec::with_capacity(NUM_BANDS);
 
     for (band_idx, _) in bands.iter().enumerate() {
