@@ -1,6 +1,7 @@
 //! Regression tests for `composite_graphics_updates`, the accumulator that turns a
 //! drain of EGFX compositor deltas into the single region `ActiveStage::process`
-//! reports to its caller.
+//! reports to its caller, and for `apply_reset_graphics`, which resizes the session's
+//! output image to the dimensions a `ResetGraphics` PDU declared.
 //!
 //! `ironrdp-session` builds with `[lib] test = false`, so inline `#[cfg(test)]`
 //! modules there never run under `cargo test --workspace --locked`. These tests
@@ -8,8 +9,8 @@
 
 use ironrdp_graphics::image_processing::PixelFormat;
 use ironrdp_pdu::geometry::ExclusiveRectangle;
-use ironrdp_session::composite_graphics_updates;
 use ironrdp_session::image::DecodedImage;
+use ironrdp_session::{apply_reset_graphics, composite_graphics_updates};
 
 fn update(left: u16, top: u16, right: u16, bottom: u16) -> (ExclusiveRectangle, Vec<u8>) {
     let w = usize::from(right - left);
@@ -142,4 +143,51 @@ fn a_delta_touching_the_image_edge_is_accepted() {
         (60, 60, 63, 63),
         "an exclusive bound equal to the image dimension must convert to the last valid pixel, not be dropped"
     );
+}
+
+#[test]
+fn apply_reset_graphics_resizes_the_image_to_the_declared_dimensions() {
+    let mut image = DecodedImage::new(PixelFormat::RgbA32, 1, 1);
+
+    apply_reset_graphics(&mut image, 800, 600).unwrap();
+
+    assert_eq!(image.width(), 800);
+    assert_eq!(image.height(), 600);
+    assert_eq!(image.pixel_format(), PixelFormat::RgbA32);
+    assert!(image.data().iter().all(|&byte| byte == 0));
+}
+
+#[test]
+fn apply_reset_graphics_rejects_zero_dimensions() {
+    let mut image = DecodedImage::new(PixelFormat::RgbA32, 1, 1);
+
+    assert!(apply_reset_graphics(&mut image, 0, 600).is_err());
+    assert!(apply_reset_graphics(&mut image, 800, 0).is_err());
+}
+
+#[test]
+fn apply_reset_graphics_rejects_dimensions_past_the_spec_maximum() {
+    let mut image = DecodedImage::new(PixelFormat::RgbA32, 1, 1);
+
+    assert!(apply_reset_graphics(&mut image, 32767, 600).is_err());
+    assert!(apply_reset_graphics(&mut image, 800, 32767).is_err());
+    assert!(apply_reset_graphics(&mut image, u32::MAX, 600).is_err());
+    assert!(apply_reset_graphics(&mut image, 800, u32::MAX).is_err());
+}
+
+#[test]
+fn apply_reset_graphics_accepts_the_exact_spec_maximum() {
+    // 32766 on both axes is ~4.1 GiB of RGBA8888 and too heavy to allocate in a unit
+    // test, so this pins the boundary on one axis at a time instead, with the other
+    // held small: it exercises the same `> MAX_GRAPHICS_DIMENSION` comparison a
+    // careless `>=` refactor would break, without the large allocation.
+    let mut image = DecodedImage::new(PixelFormat::RgbA32, 1, 1);
+    apply_reset_graphics(&mut image, 32766, 1).unwrap();
+    assert_eq!(image.width(), 32766);
+    assert_eq!(image.height(), 1);
+
+    let mut image = DecodedImage::new(PixelFormat::RgbA32, 1, 1);
+    apply_reset_graphics(&mut image, 1, 32766).unwrap();
+    assert_eq!(image.width(), 1);
+    assert_eq!(image.height(), 32766);
 }

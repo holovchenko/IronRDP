@@ -15,9 +15,9 @@ mod palette;
 
 use core::fmt;
 
-#[cfg(feature = "__test")]
-pub use active_stage::composite_graphics_updates;
 pub use active_stage::{ActiveStage, ActiveStageBuilder, ActiveStageOutput, GracefulDisconnectReason};
+#[cfg(feature = "__test")]
+pub use active_stage::{apply_reset_graphics, composite_graphics_updates};
 pub use fast_path::{BulkDecompressionErrorKind, FastPathBulkDecompressionFailure};
 
 pub type SessionResult<T> = Result<T, SessionError>;

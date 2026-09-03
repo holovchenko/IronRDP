@@ -844,6 +844,7 @@ fn process_slow_path_pointer(
 /// [`composite_graphics_updates`] on the same DVC packet: `ResetGraphics` and the deltas it
 /// makes valid are decoded together by [`GraphicsPipelineClient::process`], and compositing
 /// against the old image size would drop every delta outside the old bounds as out of range.
+#[cfg_attr(feature = "__test", visibility::make(pub))]
 fn apply_reset_graphics(image: &mut DecodedImage, width: u32, height: u32) -> SessionResult<()> {
     const MAX_GRAPHICS_DIMENSION: u32 = 32766;
 
@@ -1158,52 +1159,5 @@ mod tests {
             )
             .is_ok()
         );
-    }
-
-    #[test]
-    fn apply_reset_graphics_resizes_the_image_to_the_declared_dimensions() {
-        let mut image = DecodedImage::new(PixelFormat::RgbA32, 1, 1);
-
-        apply_reset_graphics(&mut image, 800, 600).unwrap();
-
-        assert_eq!(image.width(), 800);
-        assert_eq!(image.height(), 600);
-        assert_eq!(image.pixel_format(), PixelFormat::RgbA32);
-        assert!(image.data().iter().all(|&byte| byte == 0));
-    }
-
-    #[test]
-    fn apply_reset_graphics_rejects_zero_dimensions() {
-        let mut image = DecodedImage::new(PixelFormat::RgbA32, 1, 1);
-
-        assert!(apply_reset_graphics(&mut image, 0, 600).is_err());
-        assert!(apply_reset_graphics(&mut image, 800, 0).is_err());
-    }
-
-    #[test]
-    fn apply_reset_graphics_rejects_dimensions_past_the_spec_maximum() {
-        let mut image = DecodedImage::new(PixelFormat::RgbA32, 1, 1);
-
-        assert!(apply_reset_graphics(&mut image, 32767, 600).is_err());
-        assert!(apply_reset_graphics(&mut image, 800, 32767).is_err());
-        assert!(apply_reset_graphics(&mut image, u32::MAX, 600).is_err());
-        assert!(apply_reset_graphics(&mut image, 800, u32::MAX).is_err());
-    }
-
-    #[test]
-    fn apply_reset_graphics_accepts_the_exact_spec_maximum() {
-        // 32766 on both axes is ~4.1 GiB of RGBA8888 and too heavy to allocate in a unit
-        // test, so this pins the boundary on one axis at a time instead, with the other
-        // held small: it exercises the same `> MAX_GRAPHICS_DIMENSION` comparison a
-        // careless `>=` refactor would break, without the large allocation.
-        let mut image = DecodedImage::new(PixelFormat::RgbA32, 1, 1);
-        apply_reset_graphics(&mut image, 32766, 1).unwrap();
-        assert_eq!(image.width(), 32766);
-        assert_eq!(image.height(), 1);
-
-        let mut image = DecodedImage::new(PixelFormat::RgbA32, 1, 1);
-        apply_reset_graphics(&mut image, 1, 32766).unwrap();
-        assert_eq!(image.width(), 1);
-        assert_eq!(image.height(), 32766);
     }
 }
