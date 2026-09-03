@@ -1189,4 +1189,21 @@ mod tests {
         assert!(apply_reset_graphics(&mut image, u32::MAX, 600).is_err());
         assert!(apply_reset_graphics(&mut image, 800, u32::MAX).is_err());
     }
+
+    #[test]
+    fn apply_reset_graphics_accepts_the_exact_spec_maximum() {
+        // 32766 on both axes is ~4.1 GiB of RGBA8888 and too heavy to allocate in a unit
+        // test, so this pins the boundary on one axis at a time instead, with the other
+        // held small: it exercises the same `> MAX_GRAPHICS_DIMENSION` comparison a
+        // careless `>=` refactor would break, without the large allocation.
+        let mut image = DecodedImage::new(PixelFormat::RgbA32, 1, 1);
+        apply_reset_graphics(&mut image, 32766, 1).unwrap();
+        assert_eq!(image.width(), 32766);
+        assert_eq!(image.height(), 1);
+
+        let mut image = DecodedImage::new(PixelFormat::RgbA32, 1, 1);
+        apply_reset_graphics(&mut image, 1, 32766).unwrap();
+        assert_eq!(image.width(), 1);
+        assert_eq!(image.height(), 32766);
+    }
 }
