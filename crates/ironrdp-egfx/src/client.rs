@@ -418,6 +418,11 @@ pub struct GraphicsPipelineClient {
     current_frame_id: Option<u32>,
     frames_queued: u32,
     total_frames_decoded: u32,
+    /// Most recent `ResetGraphics` dimensions not yet claimed by [`Self::take_reset_graphics`].
+    ///
+    /// A later reset in the same DVC packet overwrites an earlier one; only the last
+    /// dimensions matter, since the session applies at most one resize per drain.
+    pending_reset: Option<(u32, u32)>,
 }
 
 impl GraphicsPipelineClient {
@@ -444,6 +449,7 @@ impl GraphicsPipelineClient {
             current_frame_id: None,
             frames_queued: 0,
             total_frames_decoded: 0,
+            pending_reset: None,
         }
     }
 
@@ -491,6 +497,18 @@ impl GraphicsPipelineClient {
     #[must_use]
     pub fn drain_output(&mut self) -> Vec<OutputUpdate> {
         self.compositor.drain_output()
+    }
+
+    /// Take the most recent `ResetGraphics` dimensions, if any arrived since the last call.
+    ///
+    /// The session must call this *before* [`Self::drain_output`] and apply the resize to
+    /// its own output image before compositing the drained deltas: `ResetGraphics` and the
+    /// deltas it makes valid arrive in the same DVC packet, decoded here in one `process`
+    /// call, so the resize has to land before those deltas are composited or they will be
+    /// dropped as out of bounds against the old image size.
+    #[must_use]
+    pub fn take_reset_graphics(&mut self) -> Option<(u32, u32)> {
+        self.pending_reset.take()
     }
 
     // ========================================================================
@@ -680,6 +698,11 @@ impl GraphicsPipelineClient {
         // Per spec, ResetGraphics implicitly destroys all surfaces
         self.surfaces.clear();
         self.compositor.reset(width, height);
+
+        // Record for the session to pick up via `take_reset_graphics`, so it can resize its
+        // own output image before compositing the deltas that follow in this same packet.
+        // A later reset in the same packet overwrites an earlier, unclaimed one.
+        self.pending_reset = Some((width, height));
 
         // Reset frame tracking state so subsequent FrameAcknowledge PDUs
         // don't report stale queue depth from a previous stream.
@@ -1699,6 +1722,91 @@ mod tests {
         assert!(client.surfaces.is_empty(), "surfaces should be cleared");
         assert!(client.current_frame_id.is_none(), "frame_id should be reset");
         assert_eq!(client.frames_queued, 0, "frame queue should be reset");
+    }
+
+    #[test]
+    fn one_packet_yields_both_the_reset_size_and_a_full_surface_delta() {
+        use ironrdp_core::encode_vec;
+        use ironrdp_graphics::zgfx::wrap_uncompressed;
+
+        const SURFACE_ID: u16 = 1;
+        const WIDTH: u16 = 64;
+        const HEIGHT: u16 = 48;
+
+        let mut client = GraphicsPipelineClient::new(Box::new(TestHandler), None);
+
+        // A single DVC packet, as a server sends after a display resize: ResetGraphics
+        // (new dimensions) followed by a full-surface repaint, all decoded by one
+        // `process()` call.
+        let pdus = [
+            GfxPdu::ResetGraphics(crate::pdu::ResetGraphicsPdu {
+                width: u32::from(WIDTH),
+                height: u32::from(HEIGHT),
+                monitors: vec![],
+            }),
+            GfxPdu::CreateSurface(crate::pdu::CreateSurfacePdu {
+                surface_id: SURFACE_ID,
+                width: WIDTH,
+                height: HEIGHT,
+                pixel_format: PixelFormat::XRgb,
+            }),
+            GfxPdu::MapSurfaceToOutput(crate::pdu::MapSurfaceToOutputPdu {
+                surface_id: SURFACE_ID,
+                output_origin_x: 0,
+                output_origin_y: 0,
+            }),
+            GfxPdu::StartFrame(crate::pdu::StartFramePdu {
+                timestamp: crate::pdu::Timestamp {
+                    milliseconds: 0,
+                    seconds: 0,
+                    minutes: 0,
+                    hours: 0,
+                },
+                frame_id: 0,
+            }),
+            GfxPdu::SolidFill(SolidFillPdu {
+                surface_id: SURFACE_ID,
+                fill_pixel: crate::pdu::Color {
+                    b: 0,
+                    g: 0,
+                    r: 0,
+                    xa: 0xFF,
+                },
+                rectangles: vec![ExclusiveRectangle {
+                    left: 0,
+                    top: 0,
+                    right: WIDTH,
+                    bottom: HEIGHT,
+                }],
+            }),
+            GfxPdu::EndFrame(crate::pdu::EndFramePdu { frame_id: 0 }),
+        ];
+
+        let mut raw = Vec::new();
+        for pdu in &pdus {
+            raw.extend(encode_vec(pdu).expect("encode PDU"));
+        }
+        let payload = wrap_uncompressed(&raw);
+
+        client.process(0, &payload).expect("process one packet");
+
+        assert_eq!(
+            client.take_reset_graphics(),
+            Some((u32::from(WIDTH), u32::from(HEIGHT))),
+            "the reset dimensions from this packet must be available to the session"
+        );
+
+        let updates = client.drain_output();
+        assert_eq!(updates.len(), 1, "the full-surface fill must reach the compositor");
+        assert_eq!(
+            (
+                updates[0].region.left,
+                updates[0].region.top,
+                updates[0].region.right,
+                updates[0].region.bottom
+            ),
+            (0, 0, WIDTH, HEIGHT)
+        );
     }
 
     #[test]

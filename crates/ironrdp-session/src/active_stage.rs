@@ -28,7 +28,7 @@ use tracing::{debug, warn};
 
 use crate::fast_path::UpdateKind;
 use crate::image::DecodedImage;
-use crate::{SessionError, SessionErrorExt as _, SessionResult, fast_path, x224};
+use crate::{SessionError, SessionErrorExt as _, SessionResult, fast_path, reason_err, x224};
 
 fn to_bulk_compression_type(compression_type: CompressionType) -> BulkCompressionType {
     match compression_type {
@@ -222,10 +222,16 @@ impl ActiveStage {
                 // data only ever arrives over a DVC, which is X224-carried, so this stays
                 // out of the Action::FastPath arm rather than running on every fast-path
                 // frame (the highest-frequency path in a session).
-                let graphics_updates = self
+                let (reset, graphics_updates) = self
                     .get_dvc_mut::<GraphicsPipelineClient>()
-                    .map(|mut gfx| gfx.processor_mut().drain_output())
+                    .map(|mut gfx| {
+                        let gfx = gfx.processor_mut();
+                        (gfx.take_reset_graphics(), gfx.drain_output())
+                    })
                     .unwrap_or_default();
+                if let Some((width, height)) = reset {
+                    apply_reset_graphics(image, width, height)?;
+                }
                 if let Some(region) =
                     composite_graphics_updates(image, graphics_updates.into_iter().map(|u| (u.region, u.data)))?
                 {
@@ -831,6 +837,37 @@ fn process_slow_path_pointer(
     fast_path_processor.process_pointer_update(image, pointer)
 }
 
+/// Resize `image` to the dimensions a `ResetGraphics` PDU declared.
+///
+/// MS-RDPEGFX 2.2.2.14 (RDPGFX_RESET_GRAPHICS_PDU) carries `width`/`height` as `u32` on the
+/// wire but requires both to not exceed 32766. This must run before
+/// [`composite_graphics_updates`] on the same DVC packet: `ResetGraphics` and the deltas it
+/// makes valid are decoded together by [`GraphicsPipelineClient::process`], and compositing
+/// against the old image size would drop every delta outside the old bounds as out of range.
+fn apply_reset_graphics(image: &mut DecodedImage, width: u32, height: u32) -> SessionResult<()> {
+    const MAX_GRAPHICS_DIMENSION: u32 = 32766;
+
+    if width == 0 || width > MAX_GRAPHICS_DIMENSION || height == 0 || height > MAX_GRAPHICS_DIMENSION {
+        return Err(reason_err!(
+            "apply_reset_graphics",
+            "ResetGraphics dimensions out of range: {width}x{height}"
+        ));
+    }
+
+    #[expect(
+        clippy::as_conversions,
+        reason = "width and height are bounded by MAX_GRAPHICS_DIMENSION above"
+    )]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "width and height are bounded by MAX_GRAPHICS_DIMENSION above"
+    )]
+    let (width, height) = (width as u16, height as u16);
+    *image = DecodedImage::new(image.pixel_format(), width, height);
+
+    Ok(())
+}
+
 /// Apply every compositor delta to `image` and return the single region covering them.
 ///
 /// Emitting one update per delta would be correct but ruinous: a consumer is entitled to
@@ -860,11 +897,11 @@ fn composite_graphics_updates(
         // which is `(0, 0, 0, 0)` and not distinguishable from a real 1x1 update at the
         // origin. Checking fit here first, rather than branching on that return value,
         // means the delta is skipped outright rather than folded into the accumulator
-        // as a phantom region. This can happen for real: the compositor clips to the
-        // dimensions ResetGraphics declared, while `image` is sized from the desktop
-        // size negotiated at connection time and is never resized on ResetGraphics, so
-        // a server that reports a larger graphics output than the desktop hits this on
-        // every delta outside the desktop bounds.
+        // as a phantom region. This can happen for real: `image` is resized to the
+        // dimensions ResetGraphics declared by `apply_reset_graphics`, called before this
+        // function on the same packet, but the compositor's own surface-to-output mapping
+        // can still name a region the server never sized `image` to cover (e.g. a stale
+        // mapping from before the reset), so an out-of-bounds delta remains possible here.
         let fits = region.left <= region.right
             && region.top <= region.bottom
             && region.right < image.width()
@@ -1121,5 +1158,35 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    #[test]
+    fn apply_reset_graphics_resizes_the_image_to_the_declared_dimensions() {
+        let mut image = DecodedImage::new(PixelFormat::RgbA32, 1, 1);
+
+        apply_reset_graphics(&mut image, 800, 600).unwrap();
+
+        assert_eq!(image.width(), 800);
+        assert_eq!(image.height(), 600);
+        assert_eq!(image.pixel_format(), PixelFormat::RgbA32);
+        assert!(image.data().iter().all(|&byte| byte == 0));
+    }
+
+    #[test]
+    fn apply_reset_graphics_rejects_zero_dimensions() {
+        let mut image = DecodedImage::new(PixelFormat::RgbA32, 1, 1);
+
+        assert!(apply_reset_graphics(&mut image, 0, 600).is_err());
+        assert!(apply_reset_graphics(&mut image, 800, 0).is_err());
+    }
+
+    #[test]
+    fn apply_reset_graphics_rejects_dimensions_past_the_spec_maximum() {
+        let mut image = DecodedImage::new(PixelFormat::RgbA32, 1, 1);
+
+        assert!(apply_reset_graphics(&mut image, 32767, 600).is_err());
+        assert!(apply_reset_graphics(&mut image, 800, 32767).is_err());
+        assert!(apply_reset_graphics(&mut image, u32::MAX, 600).is_err());
+        assert!(apply_reset_graphics(&mut image, 800, u32::MAX).is_err());
     }
 }
