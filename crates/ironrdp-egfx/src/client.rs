@@ -423,6 +423,13 @@ pub struct GraphicsPipelineClient {
     /// A later reset in the same DVC packet overwrites an earlier one; only the last
     /// dimensions matter, since the session applies at most one resize per drain.
     pending_reset: Option<(u32, u32)>,
+    /// Count of `WireToSurface2` PDUs skipped so far because progressive decode failed.
+    ///
+    /// A decoder that fails once on a stream is overwhelmingly likely to keep failing on
+    /// the same stream (a live session hit 23 skips in 25s), so only the first skip is
+    /// logged at `warn`; the rest are `debug` to keep the log from drowning in repeats of
+    /// the same underlying fault.
+    skipped_wire_to_surface2: u32,
 }
 
 impl GraphicsPipelineClient {
@@ -450,6 +457,7 @@ impl GraphicsPipelineClient {
             frames_queued: 0,
             total_frames_decoded: 0,
             pending_reset: None,
+            skipped_wire_to_surface2: 0,
         }
     }
 
@@ -885,16 +893,35 @@ impl GraphicsPipelineClient {
         ) {
             Ok(tiles) => tiles,
             Err(error) => {
-                // The decoder leaves TileState untouched on error, so the surface stays
-                // at its prior state and the next frame that touches this region repaints
-                // it. Ending the session over one bad tile would be worse than a stale
-                // region and would just get replayed by the reconnect.
-                warn!(
-                    ?error,
-                    surface_id = pdu.surface_id,
-                    codec_context_id = pdu.codec_context_id,
-                    "rfx progressive decode failed; skipping this WireToSurface2 PDU"
-                );
+                // Tiles decoded before the failing one already advanced their TileState,
+                // but no pixel from this PDU is composited onto the surface: we bail out
+                // before any tile here reaches the compositor. The region stays stale
+                // until the next frame that touches it; the progressive stream re-sends
+                // the region it refines rather than accumulating on top of it, so the
+                // next successful PDU overwrites this state rather than building on a
+                // partial one. Ending the session over one bad tile would be worse than
+                // a stale region and would just get replayed by the reconnect. An
+                // unknown surface, by contrast, stays fatal above.
+                self.skipped_wire_to_surface2 = self.skipped_wire_to_surface2.saturating_add(1);
+                if self.skipped_wire_to_surface2 == 1 {
+                    warn!(
+                        ?error,
+                        surface_id = pdu.surface_id,
+                        codec_context_id = pdu.codec_context_id,
+                        "rfx progressive decode failed; skipping this WireToSurface2 PDU"
+                    );
+                } else {
+                    // A decoder that failed once on a stream overwhelmingly keeps
+                    // failing on it (a live session hit 23 skips in 25s); logging every
+                    // one at warn would just drown the log in repeats of the same fault.
+                    debug!(
+                        ?error,
+                        surface_id = pdu.surface_id,
+                        codec_context_id = pdu.codec_context_id,
+                        skipped_wire_to_surface2 = self.skipped_wire_to_surface2,
+                        "rfx progressive decode failed; skipping this WireToSurface2 PDU"
+                    );
+                }
                 return Ok(());
             }
         };
@@ -2399,5 +2426,39 @@ mod tests {
 
         assert!(result.unwrap().is_empty());
         assert!(client.is_active());
+    }
+
+    #[test]
+    fn repeated_malformed_wire_to_surface2_payloads_stay_non_fatal_and_are_counted() {
+        let mut client = GraphicsPipelineClient::new(Box::new(TestHandler), None);
+        client
+            .handle_pdu(GfxPdu::CapabilitiesConfirm(
+                crate::pdu::CapabilitiesConfirmPdu::from_typed(&CapabilitySet::V8 {
+                    flags: CapabilitiesV8Flags::empty(),
+                }),
+            ))
+            .unwrap();
+        client
+            .handle_pdu(GfxPdu::CreateSurface(crate::pdu::CreateSurfacePdu {
+                surface_id: 1,
+                width: 64,
+                height: 64,
+                pixel_format: PixelFormat::XRgb,
+            }))
+            .unwrap();
+
+        for _ in 0..2 {
+            let result = client.handle_pdu(GfxPdu::WireToSurface2(WireToSurface2Pdu {
+                surface_id: 1,
+                codec_id: crate::pdu::Codec2Type::RemoteFxProgressive,
+                codec_context_id: 7,
+                pixel_format: PixelFormat::XRgb,
+                bitmap_data: vec![0xFF, 0xFF, 0xFF, 0xFF],
+            }));
+            assert!(result.unwrap().is_empty());
+        }
+
+        assert!(client.is_active());
+        assert_eq!(client.skipped_wire_to_surface2, 2);
     }
 }
