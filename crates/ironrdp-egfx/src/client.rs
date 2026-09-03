@@ -428,7 +428,10 @@ pub struct GraphicsPipelineClient {
     /// A decoder that fails once on a stream is overwhelmingly likely to keep failing on
     /// the same stream (a live session hit 23 skips in 25s), so only the first skip is
     /// logged at `warn`; the rest are `debug` to keep the log from drowning in repeats of
-    /// the same underlying fault.
+    /// the same underlying fault. That trade is deliberate and it costs something: with
+    /// `debug` off, which is the usual production filter, the log shows that skipping
+    /// started and never how far it went. The count lives here so a caller that wants
+    /// that number can read it; nothing in the crate reports it on its own.
     skipped_wire_to_surface2: u32,
 }
 
@@ -911,9 +914,9 @@ impl GraphicsPipelineClient {
                         "rfx progressive decode failed; skipping this WireToSurface2 PDU"
                     );
                 } else {
-                    // A decoder that failed once on a stream overwhelmingly keeps
-                    // failing on it (a live session hit 23 skips in 25s); logging every
-                    // one at warn would just drown the log in repeats of the same fault.
+                    // Every skip after the first: see `skipped_wire_to_surface2`. The
+                    // running count rides along so a debug-level log shows the scale;
+                    // without debug the first warn is all there is.
                     debug!(
                         ?error,
                         surface_id = pdu.surface_id,
