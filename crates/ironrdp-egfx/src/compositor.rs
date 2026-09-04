@@ -1194,6 +1194,73 @@ mod tests {
         assert!(c.ready.is_empty(), "queued deltas must not survive a reset");
     }
 
+    /// Strengthens `reset_releases_only_the_queued_deltas` by also exercising the
+    /// `frame` term: a payload can carry `ResetGraphics` while a frame is still
+    /// open (before `EndFrame`), and the uncommitted dirty metadata queued in
+    /// `frame` must be released too, not just the committed deltas in `ready`.
+    #[test]
+    fn reset_mid_frame_releases_the_dirty_metadata_too() {
+        const EDGE: u16 = 4096;
+        const TILE: u16 = 8;
+        const OUTPUT_W: u16 = 1920;
+        const OUTPUT_H: u16 = 1080;
+        const DELTA_W: u16 = 8;
+        const DELTA_H: u16 = 8;
+
+        let mut c = Compositor::default();
+        c.reset(u32::from(OUTPUT_W), u32::from(OUTPUT_H));
+        c.create_surface(1, EDGE, EDGE);
+        c.create_surface(2, EDGE, EDGE);
+        c.surface_to_cache(1, 7, &rect(0, 0, TILE, TILE));
+
+        // Mapping itself dirties the whole surface (it just became visible), clipped
+        // to the output. Commit that delta first so it is the test's one known
+        // `ready` entry, sized by the output rather than the surface.
+        c.map_surface(1, 0, 0);
+        c.end_frame();
+        assert_eq!(c.ready.len(), 1, "mapping the surface must have committed one delta");
+
+        let color = Color {
+            r: 0,
+            g: 0,
+            b: 0,
+            xa: 0xFF,
+        };
+
+        // An uncommitted dirty entry left in `frame` (no following `end_frame`).
+        c.solid_fill(1, &color, &[rect(10, 10, 10 + DELTA_W, 10 + DELTA_H)]);
+        assert_eq!(
+            c.frame.len(),
+            1,
+            "the fill must have queued one uncommitted dirty entry"
+        );
+
+        let surfaces_bytes = 2 * usize::from(EDGE) * usize::from(EDGE) * BYTES_PER_PIXEL;
+        let cache_bytes = usize::from(TILE) * usize::from(TILE) * BYTES_PER_PIXEL;
+        // The mapping delta is clipped to the output, which is smaller than the surface.
+        let ready_bytes = usize::from(OUTPUT_W) * usize::from(OUTPUT_H) * BYTES_PER_PIXEL;
+        let frame_bytes = size_of::<DirtyRegion>(); // one uncommitted dirty entry
+
+        assert_eq!(
+            c.allocated_bytes,
+            surfaces_bytes + cache_bytes + ready_bytes + frame_bytes,
+            "allocated_bytes must equal the explicit sum of surfaces, cache, ready and frame charges"
+        );
+
+        c.reset(u32::from(OUTPUT_W), u32::from(OUTPUT_H));
+
+        assert!(c.ready.is_empty(), "queued deltas must not survive a reset");
+        assert!(
+            c.frame.is_empty(),
+            "uncommitted dirty metadata must not survive a reset"
+        );
+        assert_eq!(
+            c.allocated_bytes,
+            surfaces_bytes + cache_bytes,
+            "reset must release both the ready deltas and the uncommitted frame metadata"
+        );
+    }
+
     /// Cache slots are a second allocation pool keyed by `u16`. Charging them against
     /// the same budget is what stops a peer from bypassing the surface limit by
     /// parking the same pixels in tens of thousands of slots instead.

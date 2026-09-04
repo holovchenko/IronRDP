@@ -358,7 +358,7 @@ fn client_deletes_surface_via_process() {
 }
 
 #[test]
-fn client_resets_surfaces_via_process() {
+fn client_keeps_surfaces_across_reset_via_process() {
     let mut client = setup_active_client_with_surface(None, 1, 100, 100);
 
     // Create a second surface
@@ -372,7 +372,8 @@ fn client_resets_surfaces_via_process() {
     assert!(client.get_surface(1).is_some());
     assert!(client.get_surface(2).is_some());
 
-    // ResetGraphics should clear all surfaces
+    // Per MS-RDPEGFX 3.3.5.14, ResetGraphics only resizes the Graphics Output Buffer;
+    // it does not destroy surfaces.
     let reset = GfxPdu::ResetGraphics(ResetGraphicsPdu {
         width: 1920,
         height: 1080,
@@ -380,13 +381,25 @@ fn client_resets_surfaces_via_process() {
     });
     client.process(0, &encode_for_process(&reset)).expect("reset");
 
-    assert!(
-        client.get_surface(1).is_none(),
-        "surface 1 should be cleared after reset"
+    let surface1 = client.get_surface(1);
+    assert!(surface1.is_some(), "surface 1 should survive reset");
+    assert_eq!(surface1.unwrap().width, 100);
+    assert_eq!(surface1.unwrap().height, 100);
+
+    let surface2 = client.get_surface(2);
+    assert!(surface2.is_some(), "surface 2 should survive reset");
+    assert_eq!(surface2.unwrap().width, 200);
+    assert_eq!(surface2.unwrap().height, 200);
+
+    assert_eq!(
+        client.take_reset_graphics(),
+        Some((1920, 1080)),
+        "the reset dimensions must be available to the session exactly once"
     );
-    assert!(
-        client.get_surface(2).is_none(),
-        "surface 2 should be cleared after reset"
+    assert_eq!(
+        client.take_reset_graphics(),
+        None,
+        "take_reset_graphics should not return the same reset twice"
     );
 }
 
