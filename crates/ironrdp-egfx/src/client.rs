@@ -706,8 +706,8 @@ impl GraphicsPipelineClient {
     }
 
     fn handle_reset_graphics(&mut self, width: u32, height: u32) {
-        // Per spec, ResetGraphics implicitly destroys all surfaces
-        self.surfaces.clear();
+        // Per MS-RDPEGFX 3.3.5.14, ResetGraphics only resizes the Graphics Output
+        // Buffer; it does not destroy surfaces, so the surface table is kept.
         self.compositor.reset(width, height);
 
         // Record for the session to pick up via `take_reset_graphics`, so it can resize its
@@ -1719,7 +1719,11 @@ mod tests {
     }
 
     #[test]
-    fn reset_graphics_clears_surfaces_and_frame_tracking() {
+    fn reset_graphics_keeps_surfaces_and_clears_frame_tracking() {
+        // Per MS-RDPEGFX 3.3.5.14, ResetGraphics only resizes the Graphics Output
+        // Buffer; it does not destroy surfaces. A Windows server relies on this: it
+        // keeps painting through cache slots and surfaces filled before the reset,
+        // which it does not re-send.
         let mut client = GraphicsPipelineClient::new(Box::new(TestHandler), None);
 
         let _ = client.handle_pdu(GfxPdu::CreateSurface(crate::pdu::CreateSurfacePdu {
@@ -1749,7 +1753,7 @@ mod tests {
             monitors: vec![],
         }));
 
-        assert!(client.surfaces.is_empty(), "surfaces should be cleared");
+        assert_eq!(client.surfaces.len(), 1, "surfaces must survive a reset");
         assert!(client.current_frame_id.is_none(), "frame_id should be reset");
         assert_eq!(client.frames_queued, 0, "frame queue should be reset");
     }

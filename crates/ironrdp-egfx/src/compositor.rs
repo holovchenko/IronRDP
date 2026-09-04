@@ -146,25 +146,36 @@ pub(crate) struct Compositor {
 }
 
 impl Compositor {
-    /// Handle `ResetGraphics`: set the output size and drop all surfaces, cache and
-    /// pending output.
+    /// Handle `ResetGraphics`: resize the graphics output and discard pending output.
     ///
-    /// Per MS-RDPEGFX 2.2.2.14 a reset implicitly destroys every surface and
-    /// redefines the graphics output, so deltas produced before it are discarded
-    /// along with the surfaces that produced them. That includes committed ones the
-    /// consumer has not drained yet: a payload may carry `EndFrame` and
-    /// `ResetGraphics` together, and those deltas were clipped against the previous
-    /// output, so painting them into the new one repaints stale pixels and, after a
-    /// shrink, addresses a region the new output no longer contains.
+    /// Per MS-RDPEGFX 3.3.5.14, the only client requirement on receiving
+    /// `RDPGFX_RESET_GRAPHICS_PDU` is to "resize the Graphics Output Buffer ...
+    /// ADM element"; 2.2.2.14 likewise describes it only as changing the output
+    /// buffer's dimensions and monitor layout. Neither mentions surfaces or the
+    /// bitmap cache, and cache slots are removed only by
+    /// `RDPGFX_EVICT_CACHE_ENTRY_PDU` (3.3.5.8). FreeRDP matches this:
+    /// `rdpgfx_recv_reset_graphics_pdu` never touches `CacheSlots` or the surface
+    /// table, and `gdi_ResetGraphics` resizes the desktop without freeing any
+    /// surface. A Windows server relies on this: after a resize it sends
+    /// `ResetGraphics` + `CreateSurface` + `StartFrame` and then keeps painting
+    /// through `CacheToSurface` with slots it filled before the reset, without
+    /// re-sending them, so dropping the cache (or the surfaces) here breaks
+    /// rendering until reconnect.
+    ///
+    /// `frame` and `ready` are still discarded: a payload may carry `EndFrame` and
+    /// `ResetGraphics` together, and those deltas were clipped against the
+    /// previous output, so painting them into the new one repaints stale pixels
+    /// and, after a shrink, addresses a region the new output no longer contains.
     pub(crate) fn reset(&mut self, width: u32, height: u32) {
         self.output_width = u16::try_from(width).unwrap_or(u16::MAX);
         self.output_height = u16::try_from(height).unwrap_or(u16::MAX);
-        self.surfaces.clear();
-        self.cache.clear();
+        let released = self.ready.iter().map(|update| update.data.len()).sum::<usize>()
+            + self.frame.len() * size_of::<DirtyRegion>();
         self.frame.clear();
         self.ready.clear();
-        // Every charged allocation lived in one of those, so the whole charge goes.
-        self.allocated_bytes = 0;
+        // Release only what was discarded: surfaces and the cache survive, so
+        // their pixel bytes stay charged.
+        self.allocated_bytes = self.allocated_bytes.saturating_sub(released);
     }
 
     /// Reserve `len` pixel bytes, or refuse if that would exceed the budget.
@@ -990,15 +1001,20 @@ mod tests {
         assert_eq!((updates[0].region.right, updates[0].region.bottom), (8, 8));
     }
 
-    /// `ResetGraphics` drops surfaces so later commands targeting them are no-ops.
+    /// `ResetGraphics` only resizes the output (MS-RDPEGFX 3.3.5.14); surfaces
+    /// survive it, so commands issued against a surface created before the reset
+    /// still paint once the surface is remapped in the new output.
     #[test]
-    fn reset_clears_surfaces() {
+    fn surfaces_survive_a_reset() {
         let mut c = Compositor::default();
-        c.reset(64, 64);
+        c.reset(128, 128);
         c.create_surface(1, 16, 16);
         c.map_surface(1, 0, 0);
-        c.reset(64, 64);
+        c.end_frame();
         let _ = c.drain_output();
+
+        // Different size than before: a server resize commonly changes it.
+        c.reset(64, 64);
 
         c.solid_fill(
             1,
@@ -1011,7 +1027,49 @@ mod tests {
             &[rect(0, 0, 8, 8)],
         );
         c.end_frame();
-        assert!(c.drain_output().is_empty());
+        let updates = c.drain_output();
+        assert_eq!(updates.len(), 1, "the surface must still be mapped after the reset");
+        assert_eq!(&updates[0].data[0..4], &[3, 2, 1, 0xFF]);
+    }
+
+    /// Cache slots are removed only by `EvictCacheEntry` (MS-RDPEGFX 3.3.5.8), never
+    /// by `ResetGraphics`. A Windows server relies on this: after a resize it sends
+    /// ResetGraphics + CreateSurface + StartFrame and then paints through
+    /// `CacheToSurface` with slots filled before the reset, without re-sending them.
+    #[test]
+    fn cache_slots_survive_a_reset() {
+        let mut c = Compositor::default();
+        c.reset(128, 128);
+        c.create_surface(1, 16, 16);
+        c.solid_fill(
+            1,
+            &Color {
+                b: 0x10,
+                g: 0x20,
+                r: 0x30,
+                xa: 0,
+            },
+            &[rect(0, 0, 8, 8)],
+        );
+        c.surface_to_cache(1, 7, &rect(0, 0, 8, 8));
+
+        c.reset(256, 256);
+        c.create_surface(2, 16, 16);
+        c.map_surface(2, 0, 0);
+        c.end_frame();
+        let _ = c.drain_output(); // discard the mapping delta
+
+        c.cache_to_surface(7, 2, &[Point { x: 2, y: 2 }]);
+        c.end_frame();
+        let updates = c.drain_output();
+
+        assert_eq!(updates.len(), 1, "the cache slot must still exist after the reset");
+        let u = &updates[0];
+        assert_eq!(
+            (u.region.left, u.region.top, u.region.right, u.region.bottom),
+            (2, 2, 10, 10)
+        );
+        assert_eq!(&u.data[0..4], &[0x30, 0x20, 0x10, 0xFF]);
     }
 
     /// A `SurfaceToSurface` source rectangle larger than the source surface is
@@ -1109,21 +1167,31 @@ mod tests {
         assert_eq!(c.surfaces.len(), 1);
     }
 
-    /// `ResetGraphics` empties both maps, so it must zero the charge with them.
+    /// `ResetGraphics` keeps surfaces and the cache, so the charge after a reset
+    /// must equal exactly their pixel bytes, not zero; only the queued (not yet
+    /// drained) deltas in `ready` are discarded, since they were clipped against
+    /// the output size that no longer applies.
     #[test]
-    fn reset_releases_the_whole_charge() {
+    fn reset_releases_only_the_queued_deltas() {
         const EDGE: u16 = 4096;
         let mut c = Compositor::default();
         c.reset(1920, 1080);
         c.create_surface(1, EDGE, EDGE);
         c.create_surface(2, EDGE, EDGE);
-        assert!(c.allocated_bytes > 0);
+        c.surface_to_cache(1, 7, &rect(0, 0, 8, 8));
+        c.map_surface(1, 0, 0);
+        c.end_frame(); // commits a delta into `ready`
+        assert!(!c.ready.is_empty(), "the mapped surface must have committed a delta");
+
+        let surfaces_and_cache_bytes = c.allocated_bytes - c.ready.iter().map(|u| u.data.len()).sum::<usize>();
 
         c.reset(1920, 1080);
+
         assert_eq!(
-            c.allocated_bytes, 0,
-            "reset drops every surface, so it drops the charge"
+            c.allocated_bytes, surfaces_and_cache_bytes,
+            "reset must keep the surfaces' and cache's charge, discarding only the queued deltas"
         );
+        assert!(c.ready.is_empty(), "queued deltas must not survive a reset");
     }
 
     /// Cache slots are a second allocation pool keyed by `u16`. Charging them against
@@ -1425,14 +1493,18 @@ mod tests {
         let mut c = Compositor::default();
         c.reset(4096, 4096);
         c.create_surface(1, 2048, 2048);
+        let surface_only = c.allocated_bytes;
         c.map_surface(1, 2048, 2048);
         c.end_frame();
         assert!(!c.ready.is_empty(), "the mapped surface must have committed a delta");
+        assert!(c.allocated_bytes > surface_only, "the queued delta must be charged");
 
         // Shrinking the output is the case that matters: the queued region sits
         // outside the new bounds entirely.
         c.reset(1920, 1080);
         assert!(c.drain_output().is_empty(), "pre-reset deltas must not be drainable");
-        assert_eq!(c.allocated_bytes, 0);
+        // The surface itself survives the reset (MS-RDPEGFX 3.3.5.14), so its charge
+        // remains; only the discarded queued delta's charge is released.
+        assert_eq!(c.allocated_bytes, surface_only);
     }
 }
