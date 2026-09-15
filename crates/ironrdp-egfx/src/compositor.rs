@@ -162,13 +162,30 @@ impl Compositor {
     /// re-sending them, so dropping the cache (or the surfaces) here breaks
     /// rendering until reconnect.
     ///
-    /// `frame` and `ready` are still discarded: a payload may carry `EndFrame` and
-    /// `ResetGraphics` together, and those deltas were clipped against the
-    /// previous output, so painting them into the new one repaints stale pixels
-    /// and, after a shrink, addresses a region the new output no longer contains.
+    /// `frame` and `ready` are discarded ONLY when the output dimensions actually
+    /// change. The reason for discarding them is that those deltas were clipped
+    /// against the previous output, so painting them into the new one repaints
+    /// stale pixels and, after a shrink, addresses a region the new output no
+    /// longer contains — and every word of that is about a *different* output.
+    ///
+    /// A same-size reset is not a different output. Windows sends one whenever it
+    /// rebuilds its own surfaces, and the consumer side agrees: the session's
+    /// `apply_reset_graphics` returns without touching the image when the
+    /// dimensions are unchanged, deliberately, to avoid a blank flash. Clearing
+    /// the queue there loses every delta of the payload that carried the reset —
+    /// the `EndFrame` immediately before it commits into `ready`, the reset wipes
+    /// `ready`, `drain_output` returns nothing, and the consumer keeps an image
+    /// that is one frame stale in exactly the region that frame repainted. The
+    /// loss is silent and never repaired: the server considers those pixels sent.
     pub(crate) fn reset(&mut self, width: u32, height: u32) {
-        self.output_width = u16::try_from(width).unwrap_or(u16::MAX);
-        self.output_height = u16::try_from(height).unwrap_or(u16::MAX);
+        let width = u16::try_from(width).unwrap_or(u16::MAX);
+        let height = u16::try_from(height).unwrap_or(u16::MAX);
+        let resized = (width, height) != (self.output_width, self.output_height);
+        self.output_width = width;
+        self.output_height = height;
+        if !resized {
+            return;
+        }
         let released = self.ready.iter().map(|update| update.data.len()).sum::<usize>()
             + self.frame.len() * size_of::<DirtyRegion>();
         self.frame.clear();
@@ -1207,13 +1224,45 @@ mod tests {
 
         let surfaces_and_cache_bytes = c.allocated_bytes - c.ready.iter().map(|u| u.data.len()).sum::<usize>();
 
-        c.reset(1920, 1080);
+        c.reset(1280, 720);
 
         assert_eq!(
             c.allocated_bytes, surfaces_and_cache_bytes,
             "reset must keep the surfaces' and cache's charge, discarding only the queued deltas"
         );
-        assert!(c.ready.is_empty(), "queued deltas must not survive a reset");
+        assert!(c.ready.is_empty(), "queued deltas must not survive a resizing reset");
+    }
+
+    /// The other half of the pair: a reset that does NOT change the output is not a
+    /// different output, so the deltas clipped against it are still valid and must
+    /// survive. Windows sends same-size `ResetGraphics` whenever it rebuilds its own
+    /// surfaces, and the session leaves the consumer's image untouched in that case,
+    /// so a cleared queue is a frame lost with nothing to repaint it.
+    #[test]
+    fn a_same_size_reset_keeps_the_queued_deltas() {
+        let mut c = Compositor::default();
+        c.reset(1920, 1080);
+        c.create_surface(1, 64, 64);
+        c.map_surface(1, 0, 0);
+        c.end_frame();
+        assert!(!c.ready.is_empty(), "the mapped surface must have committed a delta");
+        let charged = c.allocated_bytes;
+
+        c.reset(1920, 1080);
+
+        assert!(
+            !c.ready.is_empty(),
+            "a same-size reset must not discard committed deltas"
+        );
+        assert_eq!(
+            c.allocated_bytes, charged,
+            "a same-size reset releases nothing, because it discards nothing"
+        );
+        assert_eq!(
+            c.drain_output().len(),
+            1,
+            "the delta must still be drainable after a same-size reset"
+        );
     }
 
     /// Strengthens `reset_releases_only_the_queued_deltas` by also exercising the
@@ -1269,12 +1318,12 @@ mod tests {
             "allocated_bytes must equal the explicit sum of surfaces, cache, ready and frame charges"
         );
 
-        c.reset(u32::from(OUTPUT_W), u32::from(OUTPUT_H));
+        c.reset(u32::from(OUTPUT_W) / 2, u32::from(OUTPUT_H) / 2);
 
-        assert!(c.ready.is_empty(), "queued deltas must not survive a reset");
+        assert!(c.ready.is_empty(), "queued deltas must not survive a resizing reset");
         assert!(
             c.frame.is_empty(),
-            "uncommitted dirty metadata must not survive a reset"
+            "uncommitted dirty metadata must not survive a resizing reset"
         );
         assert_eq!(
             c.allocated_bytes,
