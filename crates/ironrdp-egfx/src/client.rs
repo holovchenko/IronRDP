@@ -560,7 +560,11 @@ impl GraphicsPipelineClient {
                 Ok(vec![])
             }
             GfxPdu::WireToSurface2(pdu) => {
-                trace!("WireToSurface2 (progressive codec)");
+                trace!(
+                    surface_id = pdu.surface_id,
+                    codec_context_id = pdu.codec_context_id,
+                    "WireToSurface2 (progressive codec)"
+                );
                 self.handler.on_wire_to_surface2(&pdu);
                 self.handle_wire_to_surface2(pdu)?;
                 Ok(vec![])
@@ -569,7 +573,11 @@ impl GraphicsPipelineClient {
 
             // Surface operations
             GfxPdu::SolidFill(pdu) => {
-                trace!(surface_id = pdu.surface_id, "SolidFill");
+                trace!(
+                    surface_id = pdu.surface_id,
+                    rectangles = ?pdu.rectangles,
+                    "SolidFill"
+                );
                 self.compositor
                     .solid_fill(pdu.surface_id, &pdu.fill_pixel, &pdu.rectangles);
                 self.handler.on_solid_fill(&pdu);
@@ -579,6 +587,8 @@ impl GraphicsPipelineClient {
                 trace!(
                     src = pdu.source_surface_id,
                     dst = pdu.destination_surface_id,
+                    source_rectangle = ?pdu.source_rectangle,
+                    destination_points = ?pdu.destination_points,
                     "SurfaceToSurface"
                 );
                 self.compositor.surface_to_surface(
@@ -596,6 +606,7 @@ impl GraphicsPipelineClient {
                 trace!(
                     surface_id = pdu.surface_id,
                     cache_slot = pdu.cache_slot,
+                    source_rectangle = ?pdu.source_rectangle,
                     "SurfaceToCache"
                 );
                 self.compositor
@@ -607,6 +618,7 @@ impl GraphicsPipelineClient {
                 trace!(
                     cache_slot = pdu.cache_slot,
                     surface_id = pdu.surface_id,
+                    destination_points = ?pdu.destination_points,
                     "CacheToSurface"
                 );
                 self.compositor
@@ -945,6 +957,11 @@ impl GraphicsPipelineClient {
                 bottom: tile_top + tile_height,
             };
             let mut emit_update = |destination_rectangle: ExclusiveRectangle, data: Vec<u8>| {
+                trace!(
+                    surface_id = pdu.surface_id,
+                    ?destination_rectangle,
+                    "WireToSurface2 tile painted"
+                );
                 let width = destination_rectangle.right - destination_rectangle.left;
                 let height = destination_rectangle.bottom - destination_rectangle.top;
                 let update = BitmapUpdate {

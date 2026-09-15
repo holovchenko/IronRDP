@@ -19,7 +19,7 @@
 use std::collections::BTreeMap;
 
 use ironrdp_pdu::geometry::ExclusiveRectangle;
-use tracing::debug;
+use tracing::{debug, trace};
 
 use crate::pdu::{Color, Point};
 
@@ -375,6 +375,19 @@ impl Compositor {
             (w, h)
         };
 
+        if w == 0 || h == 0 {
+            // The clamp above can collapse the tile to nothing when the source
+            // rectangle starts outside the surface. The slot is then emptied below
+            // and every later `CacheToSurface` on it is a silent no-op.
+            debug!(
+                surface_id,
+                cache_slot,
+                src_left = src_rect.left,
+                src_top = src_rect.top,
+                "SurfaceToCache clamped to an empty tile — the slot will paint nothing"
+            );
+        }
+
         let len = usize::from(w) * usize::from(h) * BYTES_PER_PIXEL;
 
         // Release first, for the same reason as `create_surface`: `BTreeMap::insert`
@@ -415,6 +428,13 @@ impl Compositor {
     /// (`CacheToSurface`).
     pub(crate) fn cache_to_surface(&mut self, cache_slot: u16, surface_id: u16, dst_points: &[Point]) {
         let Some(tile) = self.cache.get(&cache_slot) else {
+            // Silent before: the server paints from a slot this client never filled
+            // (or emptied), nothing lands, and no dirty rectangle is recorded — the
+            // region simply keeps whatever it held. Diagnosing that needs a line.
+            debug!(
+                cache_slot,
+                surface_id, "CacheToSurface on an empty cache slot — nothing painted"
+            );
             return;
         };
         let (w, h) = (tile.width, tile.height);
@@ -574,6 +594,7 @@ impl Compositor {
         // O(1); it is a repeat filter, not region coalescing.
         if let Some(last) = self.frame.last() {
             if last.surface_id == surface_id && covers(&last.rect, &rect) {
+                trace!(surface_id, ?rect, "dirty already covered by the previous entry");
                 return;
             }
         }
@@ -587,6 +608,7 @@ impl Compositor {
         if !self.charge(size_of::<DirtyRegion>()) {
             return;
         }
+        trace!(surface_id, ?rect, "dirty recorded");
         self.frame.push(DirtyRegion { surface_id, rect });
     }
 }

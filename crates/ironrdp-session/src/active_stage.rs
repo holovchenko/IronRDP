@@ -24,7 +24,7 @@ use ironrdp_pdu::window::{
 use ironrdp_pdu::{Action, mcs};
 use ironrdp_rdpei::RdpeiClient;
 use ironrdp_svc::{StaticChannelSet, SvcMessage, SvcProcessor, SvcProcessorMessages};
-use tracing::{debug, warn};
+use tracing::{debug, trace, warn};
 
 use crate::fast_path::UpdateKind;
 use crate::image::DecodedImage;
@@ -952,6 +952,7 @@ fn composite_graphics_updates(
         }
 
         let applied = image.apply_rgba32(&data, &region, false)?;
+        trace!(?applied, "compositor delta applied to the image");
         dirty = Some(match dirty {
             Some(acc) => acc.union(&applied),
             None => applied,
