@@ -4,8 +4,8 @@ use ironrdp_egfx::client::{BitmapUpdate, GraphicsPipelineClient, GraphicsPipelin
 use ironrdp_egfx::decode::{DecodedFrame, DecoderResult, H264Decoder};
 use ironrdp_egfx::pdu::{
     CapabilitiesAdvertisePdu, CapabilitiesConfirmPdu, CapabilitiesV8Flags, CapabilitySet, CapabilityVersion,
-    Codec1Type, CreateSurfacePdu, DeleteSurfacePdu, EndFramePdu, GfxPdu, PixelFormat, ResetGraphicsPdu, StartFramePdu,
-    Timestamp, WireToSurface1Pdu,
+    Codec1Type, Color, CreateSurfacePdu, DeleteSurfacePdu, EndFramePdu, GfxPdu, MapSurfaceToOutputPdu, PixelFormat,
+    ResetGraphicsPdu, SolidFillPdu, StartFramePdu, Timestamp, WireToSurface1Pdu,
 };
 use ironrdp_graphics::clearcodec::ClearCodecEncoder;
 use ironrdp_graphics::zgfx::wrap_uncompressed;
@@ -400,6 +400,176 @@ fn client_keeps_surfaces_across_reset_via_process() {
         client.take_reset_graphics(),
         None,
         "take_reset_graphics should not return the same reset twice"
+    );
+}
+
+/// A same-size `ResetGraphics` does not invalidate the frame committed just before
+/// it. Per MS-RDPEGFX 3.3.5.14, `ResetGraphics` only resizes the Graphics Output
+/// Buffer; a reset that does not change the output's dimensions resizes nothing,
+/// so the delta produced by the frame preceding it is still valid against the
+/// (unchanged) output and must stay drainable.
+#[test]
+fn client_keeps_the_delta_across_a_same_size_reset_via_process() {
+    const WIDTH: u16 = 100;
+    const HEIGHT: u16 = 100;
+
+    let mut client = setup_active_client_with_surface(None, 1, WIDTH, HEIGHT);
+
+    // Establish the output's initial dimensions, matching the surface.
+    let initial_reset = GfxPdu::ResetGraphics(ResetGraphicsPdu {
+        width: u32::from(WIDTH),
+        height: u32::from(HEIGHT),
+        monitors: vec![],
+    });
+    client
+        .process(0, &encode_for_process(&initial_reset))
+        .expect("initial reset");
+
+    let map = GfxPdu::MapSurfaceToOutput(MapSurfaceToOutputPdu {
+        surface_id: 1,
+        output_origin_x: 0,
+        output_origin_y: 0,
+    });
+    client.process(0, &encode_for_process(&map)).expect("map surface");
+    let end_map = GfxPdu::EndFrame(EndFramePdu { frame_id: 0 });
+    client.process(0, &encode_for_process(&end_map)).expect("end map frame");
+    let _ = client.drain_output(); // discard the mapping delta
+
+    let start = GfxPdu::StartFrame(StartFramePdu {
+        timestamp: Timestamp {
+            milliseconds: 0,
+            seconds: 0,
+            minutes: 0,
+            hours: 0,
+        },
+        frame_id: 1,
+    });
+    client.process(0, &encode_for_process(&start)).expect("start frame");
+
+    let fill = GfxPdu::SolidFill(SolidFillPdu {
+        surface_id: 1,
+        fill_pixel: Color {
+            b: 0x33,
+            g: 0x22,
+            r: 0x11,
+            xa: 0xFF,
+        },
+        rectangles: vec![ExclusiveRectangle {
+            left: 0,
+            top: 0,
+            right: 4,
+            bottom: 2,
+        }],
+    });
+    client.process(0, &encode_for_process(&fill)).expect("solid fill");
+
+    let end = GfxPdu::EndFrame(EndFramePdu { frame_id: 1 });
+    client.process(0, &encode_for_process(&end)).expect("end frame");
+
+    // Same size as the output already has: nothing resizes.
+    let reset = GfxPdu::ResetGraphics(ResetGraphicsPdu {
+        width: u32::from(WIDTH),
+        height: u32::from(HEIGHT),
+        monitors: vec![],
+    });
+    client.process(0, &encode_for_process(&reset)).expect("same-size reset");
+
+    let updates = client.drain_output();
+    assert_eq!(
+        updates.len(),
+        1,
+        "the delta committed just before a same-size reset must still be drainable"
+    );
+    assert_eq!(
+        (
+            updates[0].region.left,
+            updates[0].region.top,
+            updates[0].region.right,
+            updates[0].region.bottom
+        ),
+        (0, 0, 4, 2),
+        "the drained region must match what the SolidFill dirtied"
+    );
+}
+
+/// The other half of the pair: a `ResetGraphics` that DOES change the output's
+/// dimensions discards the preceding frame's delta, because it was clipped against
+/// the output size that no longer applies. Per MS-RDPEGFX 3.3.5.14, a dimension
+/// change resizes the Graphics Output Buffer, invalidating what was clipped to the
+/// old one.
+#[test]
+fn client_discards_the_delta_across_a_different_size_reset_via_process() {
+    const WIDTH: u16 = 100;
+    const HEIGHT: u16 = 100;
+
+    let mut client = setup_active_client_with_surface(None, 1, WIDTH, HEIGHT);
+
+    // Establish the output's initial dimensions, matching the surface.
+    let initial_reset = GfxPdu::ResetGraphics(ResetGraphicsPdu {
+        width: u32::from(WIDTH),
+        height: u32::from(HEIGHT),
+        monitors: vec![],
+    });
+    client
+        .process(0, &encode_for_process(&initial_reset))
+        .expect("initial reset");
+
+    let map = GfxPdu::MapSurfaceToOutput(MapSurfaceToOutputPdu {
+        surface_id: 1,
+        output_origin_x: 0,
+        output_origin_y: 0,
+    });
+    client.process(0, &encode_for_process(&map)).expect("map surface");
+    let end_map = GfxPdu::EndFrame(EndFramePdu { frame_id: 0 });
+    client.process(0, &encode_for_process(&end_map)).expect("end map frame");
+    let _ = client.drain_output(); // discard the mapping delta
+
+    let start = GfxPdu::StartFrame(StartFramePdu {
+        timestamp: Timestamp {
+            milliseconds: 0,
+            seconds: 0,
+            minutes: 0,
+            hours: 0,
+        },
+        frame_id: 1,
+    });
+    client.process(0, &encode_for_process(&start)).expect("start frame");
+
+    let fill = GfxPdu::SolidFill(SolidFillPdu {
+        surface_id: 1,
+        fill_pixel: Color {
+            b: 0x33,
+            g: 0x22,
+            r: 0x11,
+            xa: 0xFF,
+        },
+        rectangles: vec![ExclusiveRectangle {
+            left: 0,
+            top: 0,
+            right: 4,
+            bottom: 2,
+        }],
+    });
+    client.process(0, &encode_for_process(&fill)).expect("solid fill");
+
+    let end = GfxPdu::EndFrame(EndFramePdu { frame_id: 1 });
+    client.process(0, &encode_for_process(&end)).expect("end frame");
+
+    // Different size than the output already has.
+    let reset = GfxPdu::ResetGraphics(ResetGraphicsPdu {
+        width: u32::from(WIDTH) * 2,
+        height: u32::from(HEIGHT) * 2,
+        monitors: vec![],
+    });
+    client
+        .process(0, &encode_for_process(&reset))
+        .expect("different-size reset");
+
+    let updates = client.drain_output();
+    assert!(
+        updates.is_empty(),
+        "the delta committed before a resizing reset must be discarded, \
+         since it was clipped against the output size that no longer applies"
     );
 }
 

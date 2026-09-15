@@ -178,9 +178,12 @@ impl Compositor {
     /// that is one frame stale in exactly the region that frame repainted. The
     /// loss is silent and never repaired: the server considers those pixels sent.
     pub(crate) fn reset(&mut self, width: u32, height: u32) {
+        // Compared before clamping: two different oversized dimensions can both
+        // clamp to `u16::MAX`, and comparing the clamped values would then wrongly
+        // treat that as a same-size reset.
+        let resized = (width, height) != (u32::from(self.output_width), u32::from(self.output_height));
         let width = u16::try_from(width).unwrap_or(u16::MAX);
         let height = u16::try_from(height).unwrap_or(u16::MAX);
-        let resized = (width, height) != (self.output_width, self.output_height);
         self.output_width = width;
         self.output_height = height;
         if !resized {
@@ -1329,6 +1332,49 @@ mod tests {
             c.allocated_bytes,
             surfaces_bytes + cache_bytes,
             "reset must release both the ready deltas and the uncommitted frame metadata"
+        );
+    }
+
+    /// Sibling of `a_same_size_reset_keeps_the_queued_deltas`, but for the `frame`
+    /// term instead of `ready`: a same-size `ResetGraphics` can also arrive mid-frame
+    /// (before `EndFrame`), and the uncommitted dirty metadata queued in `frame` must
+    /// survive it too, exactly as the committed deltas in `ready` do — a reset that
+    /// changes nothing invalidates nothing (MS-RDPEGFX 3.3.5.14: reset resizes the
+    /// Graphics Output Buffer).
+    #[test]
+    fn a_same_size_reset_mid_frame_keeps_the_dirty_metadata_too() {
+        let mut c = Compositor::default();
+        c.reset(1920, 1080);
+        c.create_surface(1, 64, 64);
+        c.map_surface(1, 0, 0);
+        c.end_frame();
+        let _ = c.drain_output(); // discard the mapping delta
+
+        let color = Color {
+            r: 1,
+            g: 2,
+            b: 3,
+            xa: 0,
+        };
+        c.solid_fill(1, &color, &[rect(0, 0, 8, 8)]);
+        assert_eq!(
+            c.frame.len(),
+            1,
+            "the fill must have queued one uncommitted dirty entry"
+        );
+
+        c.reset(1920, 1080);
+
+        assert!(
+            !c.frame.is_empty(),
+            "a same-size reset must not discard uncommitted dirty metadata"
+        );
+
+        c.end_frame();
+        assert_eq!(
+            c.drain_output().len(),
+            1,
+            "the uncommitted delta must still be drainable after a same-size reset"
         );
     }
 
