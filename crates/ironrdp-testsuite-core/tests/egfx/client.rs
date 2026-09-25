@@ -1,11 +1,13 @@
 use ironrdp_core::{Decode as _, Encode, ReadCursor, WriteCursor, encode_vec};
 use ironrdp_dvc::DvcProcessor as _;
-use ironrdp_egfx::client::{BitmapUpdate, GraphicsPipelineClient, GraphicsPipelineHandler, Surface};
+use ironrdp_egfx::client::{
+    BitmapUpdate, CodecProcessed, DecodedCodec, GraphicsPipelineClient, GraphicsPipelineHandler, Surface,
+};
 use ironrdp_egfx::decode::{DecodedFrame, DecoderResult, H264Decoder};
 use ironrdp_egfx::pdu::{
     CapabilitiesAdvertisePdu, CapabilitiesConfirmPdu, CapabilitiesV8Flags, CapabilitySet, CapabilityVersion,
-    Codec1Type, Color, CreateSurfacePdu, DeleteSurfacePdu, EndFramePdu, GfxPdu, MapSurfaceToOutputPdu, PixelFormat,
-    ResetGraphicsPdu, SolidFillPdu, StartFramePdu, Timestamp, WireToSurface1Pdu,
+    Codec1Type, Codec2Type, Color, CreateSurfacePdu, DeleteSurfacePdu, EndFramePdu, GfxPdu, MapSurfaceToOutputPdu,
+    PixelFormat, ResetGraphicsPdu, SolidFillPdu, StartFramePdu, Timestamp, WireToSurface1Pdu, WireToSurface2Pdu,
 };
 use ironrdp_graphics::clearcodec::ClearCodecEncoder;
 use ironrdp_graphics::zgfx::wrap_uncompressed;
@@ -849,4 +851,183 @@ fn client_close_transitions_to_inactive() {
 
     client.close(0);
     assert!(!client.is_active(), "client should not be active after close");
+}
+
+// ============================================================================
+// Tests: Codec Telemetry
+// ============================================================================
+
+use std::sync::{Arc, Mutex};
+
+/// Handler recording `on_codec_processed` calls, used to pin the telemetry
+/// callback introduced for surface-command cost reporting.
+#[derive(Default)]
+struct RecordingHandler {
+    codec_processed: Arc<Mutex<Vec<CodecProcessed>>>,
+}
+
+impl RecordingHandler {
+    fn new() -> (Self, Arc<Mutex<Vec<CodecProcessed>>>) {
+        let codec_processed = Arc::new(Mutex::new(Vec::new()));
+        (
+            Self {
+                codec_processed: Arc::clone(&codec_processed),
+            },
+            codec_processed,
+        )
+    }
+}
+
+impl GraphicsPipelineHandler for RecordingHandler {
+    fn on_codec_processed(&mut self, info: &CodecProcessed) {
+        self.codec_processed.lock().unwrap().push(*info);
+    }
+}
+
+fn setup_recording_client_with_surface(
+    surface_id: u16,
+    width: u16,
+    height: u16,
+) -> (GraphicsPipelineClient, Arc<Mutex<Vec<CodecProcessed>>>) {
+    let (handler, codec_processed) = RecordingHandler::new();
+    let mut client = GraphicsPipelineClient::new(Box::new(handler), None);
+
+    let confirm = GfxPdu::CapabilitiesConfirm(CapabilitiesConfirmPdu::from_typed(&CapabilitySet::V8 {
+        flags: CapabilitiesV8Flags::empty(),
+    }));
+    client
+        .process(0, &encode_for_process(&confirm))
+        .expect("confirm should succeed");
+
+    let create = GfxPdu::CreateSurface(CreateSurfacePdu {
+        surface_id,
+        width,
+        height,
+        pixel_format: PixelFormat::XRgb,
+    });
+    client
+        .process(0, &encode_for_process(&create))
+        .expect("create surface should succeed");
+
+    (client, codec_processed)
+}
+
+#[test]
+fn codec_processed_reports_surface_codec_payload_size() {
+    let (mut client, codec_processed) = setup_recording_client_with_surface(1, 4, 4);
+
+    let bitmap_data = vec![0u8; 4 * 4 * 4];
+    let expected_len = bitmap_data.len();
+
+    let pdu = GfxPdu::WireToSurface1(WireToSurface1Pdu {
+        surface_id: 1,
+        codec_id: Codec1Type::Uncompressed,
+        pixel_format: PixelFormat::XRgb,
+        destination_rectangle: ExclusiveRectangle {
+            left: 0,
+            top: 0,
+            right: 4,
+            bottom: 4,
+        },
+        bitmap_data,
+    });
+    client
+        .process(0, &encode_for_process(&pdu))
+        .expect("uncompressed should succeed");
+
+    let recorded = codec_processed.lock().unwrap();
+    assert_eq!(recorded.len(), 1, "expected exactly one on_codec_processed call");
+    assert_eq!(recorded[0].surface_id, 1);
+    assert_eq!(recorded[0].codec, DecodedCodec::Wire1(Codec1Type::Uncompressed));
+    assert_eq!(recorded[0].payload_bytes, expected_len);
+}
+
+#[test]
+fn codec_processed_fires_for_a_forwarded_avc444_pdu() {
+    let (mut client, codec_processed) = setup_recording_client_with_surface(1, 4, 4);
+
+    let bitmap_data = vec![0u8; 12];
+    let expected_len = bitmap_data.len();
+
+    let pdu = GfxPdu::WireToSurface1(WireToSurface1Pdu {
+        surface_id: 1,
+        codec_id: Codec1Type::Avc444,
+        pixel_format: PixelFormat::XRgb,
+        destination_rectangle: ExclusiveRectangle {
+            left: 0,
+            top: 0,
+            right: 4,
+            bottom: 4,
+        },
+        bitmap_data,
+    });
+    client
+        .process(0, &encode_for_process(&pdu))
+        .expect("AVC444 forward should succeed");
+
+    let recorded = codec_processed.lock().unwrap();
+    assert_eq!(
+        recorded.len(),
+        1,
+        "a codec forwarded to on_unhandled_pdu must still report once"
+    );
+    assert_eq!(recorded[0].surface_id, 1);
+    assert_eq!(recorded[0].codec, DecodedCodec::Wire1(Codec1Type::Avc444));
+    assert_eq!(recorded[0].payload_bytes, expected_len);
+}
+
+#[test]
+fn codec_processed_is_not_reported_when_handling_fails() {
+    let (mut client, codec_processed) = setup_recording_client_with_surface(1, 4, 4);
+
+    let pdu = GfxPdu::WireToSurface1(WireToSurface1Pdu {
+        surface_id: 99, // unknown surface
+        codec_id: Codec1Type::Uncompressed,
+        pixel_format: PixelFormat::XRgb,
+        destination_rectangle: ExclusiveRectangle {
+            left: 0,
+            top: 0,
+            right: 4,
+            bottom: 4,
+        },
+        bitmap_data: vec![0u8; 4 * 4 * 4],
+    });
+    let result = client.process(0, &encode_for_process(&pdu));
+    assert!(result.is_err(), "unknown surface should still be rejected");
+
+    let recorded = codec_processed.lock().unwrap();
+    assert!(
+        recorded.is_empty(),
+        "on_codec_processed must not fire when handling returns Err"
+    );
+}
+
+#[test]
+fn codec_processed_fires_for_a_skipped_progressive_pdu() {
+    let (mut client, codec_processed) = setup_recording_client_with_surface(1, 4, 4);
+
+    // Empty bitmap_data is not a valid progressive stream: decode_bitmap fails and
+    // handle_wire_to_surface2 hits the skip path, returning Ok(()).
+    let pdu = WireToSurface2Pdu {
+        surface_id: 1,
+        codec_id: Codec2Type::RemoteFxProgressive,
+        codec_context_id: 0,
+        pixel_format: PixelFormat::XRgb,
+        bitmap_data: Vec::new(),
+    };
+    let expected_len = pdu.bitmap_data.len();
+    let gfx_pdu = GfxPdu::WireToSurface2(pdu);
+    client
+        .process(0, &encode_for_process(&gfx_pdu))
+        .expect("skipped progressive PDU should still return Ok");
+
+    let recorded = codec_processed.lock().unwrap();
+    assert_eq!(
+        recorded.len(),
+        1,
+        "a progressive PDU skipped after a decode failure must still report once"
+    );
+    assert_eq!(recorded[0].surface_id, 1);
+    assert_eq!(recorded[0].codec, DecodedCodec::Progressive);
+    assert_eq!(recorded[0].payload_bytes, expected_len);
 }

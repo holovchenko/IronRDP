@@ -210,6 +210,34 @@ pub struct BitmapUpdate {
 }
 
 // ============================================================================
+// Codec Processed
+// ============================================================================
+
+/// Which decoder path a surface command went through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecodedCodec {
+    /// `WireToSurface1` carrying this codec id.
+    Wire1(Codec1Type),
+    /// `WireToSurface2` (RemoteFX Progressive).
+    Progressive,
+}
+
+/// What one `WireToSurface1`/`WireToSurface2` PDU cost the client.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CodecProcessed {
+    pub surface_id: u16,
+    pub codec: DecodedCodec,
+    /// Length of the PDU's `bitmap_data`: the codec payload as the server encoded it
+    /// (after ZGFX decompression, before decoding).
+    pub payload_bytes: usize,
+    /// Wall time to process this PDU: decoding and compositing, plus any handler
+    /// callback invoked along the way (e.g. `on_bitmap_updated`). For codecs the
+    /// crate does not decode (e.g. AVC444), this measures only the dispatch to
+    /// [`GraphicsPipelineHandler::on_unhandled_pdu`], with no in-crate decode cost.
+    pub elapsed: core::time::Duration,
+}
+
+// ============================================================================
 // Handler Trait
 // ============================================================================
 
@@ -271,6 +299,14 @@ pub trait GraphicsPipelineHandler: Send {
     /// This is the primary output path. The `update` contains the
     /// surface ID, destination rectangle, and RGBA pixel data.
     fn on_bitmap_updated(&mut self, _update: &BitmapUpdate) {}
+
+    /// Called after a `WireToSurface1`/`WireToSurface2` PDU was handled without error
+    ///
+    /// Reports the surface, the codec path taken, the codec payload size, and the wall
+    /// time spent handling it. Fires for decoded codecs, codecs forwarded to
+    /// [`GraphicsPipelineHandler::on_unhandled_pdu`], and progressive PDUs skipped after
+    /// a tile decode failure. Never called when handling returns `Err`.
+    fn on_codec_processed(&mut self, _info: &CodecProcessed) {}
 
     /// Called when a logical frame is complete
     ///
@@ -556,7 +592,19 @@ impl GraphicsPipelineClient {
                 Ok(vec![])
             }
             GfxPdu::WireToSurface1(wire) => {
+                let surface_id = wire.surface_id;
+                let codec = DecodedCodec::Wire1(wire.codec_id);
+                let payload_bytes = wire.bitmap_data.len();
+                // `Instant::now()` is not reached on wasm: the web client never registers
+                // `GraphicsPipelineClient`.
+                let started_at = std::time::Instant::now();
                 self.handle_wire_to_surface1(wire)?;
+                self.handler.on_codec_processed(&CodecProcessed {
+                    surface_id,
+                    codec,
+                    payload_bytes,
+                    elapsed: started_at.elapsed(),
+                });
                 Ok(vec![])
             }
             GfxPdu::WireToSurface2(pdu) => {
@@ -566,7 +614,18 @@ impl GraphicsPipelineClient {
                     "WireToSurface2 (progressive codec)"
                 );
                 self.handler.on_wire_to_surface2(&pdu);
+                let surface_id = pdu.surface_id;
+                let payload_bytes = pdu.bitmap_data.len();
+                // `Instant::now()` is not reached on wasm: the web client never registers
+                // `GraphicsPipelineClient`.
+                let started_at = std::time::Instant::now();
                 self.handle_wire_to_surface2(pdu)?;
+                self.handler.on_codec_processed(&CodecProcessed {
+                    surface_id,
+                    codec: DecodedCodec::Progressive,
+                    payload_bytes,
+                    elapsed: started_at.elapsed(),
+                });
                 Ok(vec![])
             }
             GfxPdu::EndFrame(end) => self.handle_end_frame(end.frame_id),
