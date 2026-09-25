@@ -502,13 +502,6 @@ impl Compositor {
     /// prefix too, MS-RDPEGFX 2.2.2.17). Malformed tiles (zero-sized, or `data` not
     /// `width * height * 4` bytes) and repeated keys are skipped. Anything staged
     /// earlier is released first.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "stage_import/commit_import/discard_import/cache_tile are wired up by a later Tessera task; only tests call them so far"
-        )
-    )]
     pub(crate) fn stage_import(&mut self, tiles: Vec<CacheImportTile>) -> Vec<CacheEntryMetadata> {
         self.discard_import();
         let mut entries = Vec::new();
@@ -565,13 +558,6 @@ impl Compositor {
     /// index past the offer, a reply with nothing staged, a slot named twice — cannot be
     /// filled by anything the client holds and is reported in `unfilled_slots`. Every
     /// staged tile the reply does not name is released.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "commit_import/cache_tile are wired up by a later Tessera task; only tests call them so far"
-        )
-    )]
     pub(crate) fn commit_import(&mut self, cache_slots: &[u16]) -> CacheImportOutcome {
         let mut staged = core::mem::take(&mut self.staged_import);
         let mut outcome = CacheImportOutcome {
@@ -614,13 +600,6 @@ impl Compositor {
     }
 
     /// The tile in `cache_slot`, as `(width, height, rgba)`.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "cache_tile is wired up by a later Tessera task; only tests call it so far"
-        )
-    )]
     pub(crate) fn cache_tile(&self, cache_slot: u16) -> Option<(u16, u16, &[u8])> {
         self.cache
             .get(&cache_slot)
