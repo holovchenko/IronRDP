@@ -67,14 +67,15 @@ use tracing::{debug, trace, warn};
 
 use crate::CHANNEL_NAME;
 use crate::compositor::{Compositor, OutputUpdate};
-use crate::decode::H264Decoder;
+use crate::decode::{H264Decoder, H264YuvDecoder, YuvDecoderFactory};
 use crate::pdu::{
-    Avc420BitmapStream, CacheImportReplyPdu, CacheToSurfacePdu, CapabilitiesAdvertisePdu, CapabilitiesV8Flags,
-    CapabilitiesV81Flags, CapabilitiesV107Flags, CapabilitySet, Codec1Type, DeleteEncodingContextPdu,
-    EvictCacheEntryPdu, FrameAcknowledgePdu, GfxPdu, MapSurfaceToScaledOutputPdu, MapSurfaceToScaledWindowPdu,
-    MapSurfaceToWindowPdu, PixelFormat, QueueDepth, RawCapabilitySet, SolidFillPdu, SurfaceToCachePdu,
-    SurfaceToSurfacePdu, WireToSurface2Pdu,
+    Avc420BitmapStream, Avc444BitmapStream, CacheImportReplyPdu, CacheToSurfacePdu, CapabilitiesAdvertisePdu,
+    CapabilitiesV8Flags, CapabilitiesV81Flags, CapabilitiesV107Flags, CapabilitySet, Codec1Type,
+    DeleteEncodingContextPdu, Encoding, EvictCacheEntryPdu, FrameAcknowledgePdu, GfxPdu, MapSurfaceToScaledOutputPdu,
+    MapSurfaceToScaledWindowPdu, MapSurfaceToWindowPdu, PixelFormat, QueueDepth, RawCapabilitySet, SolidFillPdu,
+    SurfaceToCachePdu, SurfaceToSurfacePdu, WireToSurface2Pdu,
 };
+use crate::yuv444::{ChromaLayout, PlaneRect, Yuv444Planes, apply_aux_view, apply_main_view, convert_rect_to_rgba};
 
 /// Max capacity to keep for decompressed buffer when cleared.
 const MAX_DECOMPRESSED_BUFFER_CAPACITY: usize = 16384; // 16 KiB
@@ -106,6 +107,28 @@ pub struct Surface {
     pub output_origin_x: u32,
     /// Output Y origin (if mapped)
     pub output_origin_y: u32,
+}
+
+// ============================================================================
+// AVC444 Surface State
+// ============================================================================
+
+/// Per-surface state for AVC444 / AVC444v2 decoding ([MS-RDPEGFX] 3.3.8.3.2 /
+/// 3.3.8.3.3): two independent H.264 decoder instances (each stream has its
+/// own reference chain) feeding one persistent, not-yet-reverse-filtered
+/// [`Yuv444Planes`] picture.
+struct Avc444Surface {
+    /// Decodes the main (luma + filtered chroma) stream.
+    main: Box<dyn H264YuvDecoder>,
+    /// Decodes the auxiliary (chroma detail) stream.
+    aux: Box<dyn H264YuvDecoder>,
+    /// Reconstructed 4:4:4 picture, sized to the main decoder's frame dimensions.
+    planes: Yuv444Planes,
+    /// Whether a main-view update has ever landed, so a chroma-only (`LC=2`)
+    /// update arriving before any luma has something to combine with.
+    has_luma: bool,
+    /// Scratch RGBA buffer reused across [`convert_rect_to_rgba`] calls.
+    rgba: Vec<u8>,
 }
 
 // ============================================================================
@@ -441,6 +464,11 @@ enum ClientState {
 pub struct GraphicsPipelineClient {
     handler: Box<dyn GraphicsPipelineHandler>,
     h264_decoder: Option<Box<dyn H264Decoder>>,
+    /// Factory for the two `H264YuvDecoder` instances (main, aux) a new AVC444
+    /// surface needs. `None` means AVC444/AVC444v2 frames are logged and skipped,
+    /// mirroring `h264_decoder`.
+    avc444_decoders: Option<YuvDecoderFactory>,
+    avc444_surfaces: BTreeMap<u16, Avc444Surface>,
     /// Built on first use via [`Self::decode_clearcodec`]. `None` means no ClearCodec
     /// frame has arrived yet, not that the codec is unsupported: keeping the ~1.37 MiB
     /// V-bar and glyph cache spine (see `ClearCodecDecoder::new`) unallocated saves that
@@ -476,6 +504,10 @@ pub struct GraphicsPipelineClient {
     /// started and never how far it went. The count lives here so a caller that wants
     /// that number can read it; nothing in the crate reports it on its own.
     skipped_wire_to_surface2: u32,
+    /// Count of AVC444/AVC444v2 `WireToSurface1` PDUs skipped so far (malformed
+    /// stream info, missing/failed decoder, or chroma before any luma). Same
+    /// warn-once/debug-after pattern as `skipped_wire_to_surface2`.
+    skipped_avc444: u32,
 }
 
 impl GraphicsPipelineClient {
@@ -489,6 +521,8 @@ impl GraphicsPipelineClient {
         Self {
             handler,
             h264_decoder,
+            avc444_decoders: None,
+            avc444_surfaces: BTreeMap::new(),
             clearcodec_decoder: None,
             planar_decoder: BitmapStreamDecoder::default(),
             progressive_decoder: ProgressiveDecoder::new(),
@@ -504,7 +538,19 @@ impl GraphicsPipelineClient {
             total_frames_decoded: 0,
             pending_reset: None,
             skipped_wire_to_surface2: 0,
+            skipped_avc444: 0,
         }
+    }
+
+    /// Attach the factory used to create the two `H264YuvDecoder` instances
+    /// (main, aux) each new AVC444/AVC444v2 surface needs.
+    ///
+    /// Without this, `Codec1Type::Avc444` and `Avc444v2` frames are logged and
+    /// skipped, mirroring the `h264_decoder` constructor argument for AVC420.
+    #[must_use]
+    pub fn with_avc444_decoders(mut self, factory: YuvDecoderFactory) -> Self {
+        self.avc444_decoders = Some(factory);
+        self
     }
 
     // ========================================================================
@@ -806,6 +852,15 @@ impl GraphicsPipelineClient {
         if let Some(ref mut decoder) = self.h264_decoder {
             decoder.reset();
         }
+        // Reset both AVC444 decoders of every surface. ResetGraphics keeps surfaces
+        // (only resizes the Graphics Output Buffer, see below), so the surfaces
+        // themselves and their reconstructed Yuv444Planes are kept; but the main and
+        // aux H.264 streams are two independent reference chains that the server
+        // restarts with a new frame on reset, exactly like `h264_decoder` above.
+        for state in self.avc444_surfaces.values_mut() {
+            state.main.reset();
+            state.aux.reset();
+        }
         // The Progressive decoder is deliberately NOT reset here either. Its context lifetime
         // is driven by DeleteEncodingContext and DeleteSurface; MS-RDPEGFX 3.3.5.14 only
         // resizes the Graphics Output Buffer. Windows establishes a codec context once and
@@ -846,6 +901,7 @@ impl GraphicsPipelineClient {
 
     fn handle_delete_surface(&mut self, surface_id: u16) {
         self.progressive_decoder.delete_surface(surface_id);
+        self.avc444_surfaces.remove(&surface_id);
         if self.surfaces.remove(&surface_id).is_some() {
             self.compositor.delete_surface(surface_id);
             debug!(surface_id, "Surface deleted");
@@ -931,13 +987,23 @@ impl GraphicsPipelineClient {
             );
         }
 
+        // Captured before the match: `decode_avc444` needs `&mut self`, which would
+        // conflict with `surface` (borrowed from `self.surfaces`) still being live.
+        let (surface_width, surface_height) = (surface.width, surface.height);
+
         match pdu.codec_id {
             Codec1Type::Avc420 => {
                 self.decode_avc420(pdu.surface_id, &pdu.destination_rectangle, &pdu.bitmap_data)?;
             }
             Codec1Type::Avc444 | Codec1Type::Avc444v2 => {
-                debug!("AVC444 codec not yet implemented, forwarding to handler");
-                self.handler.on_unhandled_pdu(&GfxPdu::WireToSurface1(pdu));
+                self.decode_avc444(
+                    pdu.surface_id,
+                    &pdu.destination_rectangle,
+                    surface_width,
+                    surface_height,
+                    &pdu.bitmap_data,
+                    pdu.codec_id,
+                )?;
             }
             Codec1Type::ClearCodec => {
                 self.decode_clearcodec(pdu.surface_id, &pdu.destination_rectangle, &pdu.bitmap_data)?;
@@ -1127,6 +1193,241 @@ impl GraphicsPipelineClient {
         Ok(())
     }
 
+    /// Decode an AVC444 / AVC444v2 bitmap update ([MS-RDPEGFX] 3.3.8.3.2 / 3.3.8.3.3).
+    ///
+    /// Each surface keeps two independent H.264 decoder instances — `main` (the
+    /// 4:2:0 luma + filtered-chroma stream) and `aux` (the auxiliary chroma-detail
+    /// stream) — because the two streams have independent reference chains; sharing
+    /// one decoder between them would desync every IDR/P-frame boundary. `LC`
+    /// (MS-RDPEGFX 2.2.4.5) selects which stream(s) this PDU carries: 0 = both
+    /// (`stream1` = main, `stream2` = aux), 1 = main only, 2 = aux only — fed to the
+    /// `aux` decoder even though it travels as `stream1` on the wire, since the
+    /// encoding tag, not the field name, says which stream this is.
+    ///
+    /// Decoded pictures are reconstructed into a persistent [`Yuv444Planes`] kept
+    /// per surface (architecture: the main view replicates its filtered chroma over
+    /// the whole 2x2 block; an aux view overwrites the other three samples), then
+    /// converted to RGBA and painted per region rectangle, mirroring
+    /// [`Self::decode_avc420`]. Any failure (malformed stream info, no/failing
+    /// decoder, chroma before any luma) drops this PDU and resets both decoders —
+    /// see [`note_avc444_skip`].
+    fn decode_avc444(
+        &mut self,
+        surface_id: u16,
+        dest_rect: &ExclusiveRectangle,
+        surface_width: u16,
+        surface_height: u16,
+        bitmap_data: &[u8],
+        codec_id: Codec1Type,
+    ) -> PduResult<()> {
+        let mut cursor = ReadCursor::new(bitmap_data);
+        let stream = match Avc444BitmapStream::decode(&mut cursor) {
+            Ok(stream) => stream,
+            Err(_) => {
+                note_avc444_skip(&mut self.skipped_avc444, surface_id, "malformed AVC444 stream info");
+                return Ok(());
+            }
+        };
+
+        if !self.avc444_surfaces.contains_key(&surface_id) {
+            let Some(factory) = self.avc444_decoders.as_ref() else {
+                note_avc444_skip(
+                    &mut self.skipped_avc444,
+                    surface_id,
+                    "no AVC444 decoder factory configured",
+                );
+                return Ok(());
+            };
+            let Some(main) = factory() else {
+                note_avc444_skip(
+                    &mut self.skipped_avc444,
+                    surface_id,
+                    "AVC444 decoder factory returned no main decoder",
+                );
+                return Ok(());
+            };
+            let Some(aux) = factory() else {
+                note_avc444_skip(
+                    &mut self.skipped_avc444,
+                    surface_id,
+                    "AVC444 decoder factory returned no aux decoder",
+                );
+                return Ok(());
+            };
+            self.avc444_surfaces.insert(
+                surface_id,
+                Avc444Surface {
+                    main,
+                    aux,
+                    planes: Yuv444Planes::new(0, 0),
+                    has_luma: false,
+                    rgba: Vec::new(),
+                },
+            );
+        }
+
+        let layout = if codec_id == Codec1Type::Avc444v2 {
+            ChromaLayout::V2
+        } else {
+            ChromaLayout::V1
+        };
+        // MS-RDPEGFX 2.2.1.4.1: region rectangles are surface coordinates; `dest_rect`
+        // is applied as an extra clip (the design doc's ground-truth note).
+        let clip = PlaneRect::from(dest_rect).intersect(&PlaneRect {
+            left: 0,
+            top: 0,
+            right: usize::from(surface_width),
+            bottom: usize::from(surface_height),
+        });
+
+        let state = self
+            .avc444_surfaces
+            .get_mut(&surface_id)
+            .expect("just checked or inserted above");
+        let Avc444Surface {
+            main,
+            aux,
+            planes,
+            has_luma,
+            rgba,
+        } = state;
+
+        match stream.encoding {
+            Encoding::LUMA_AND_CHROMA => {
+                let Some(stream2) = stream.stream2.as_ref() else {
+                    // Ruled out by `Avc444BitmapStream::decode` today (LC=0 always
+                    // carries stream2), but keep the guard for defense in depth.
+                    main.reset();
+                    aux.reset();
+                    note_avc444_skip(&mut self.skipped_avc444, surface_id, "LC=0 missing stream2");
+                    return Ok(());
+                };
+
+                let main_decoded = main.decode_yuv(stream.stream1.data);
+                let main_failed = main_decoded.is_err();
+                let aux_decoded = aux.decode_yuv(stream2.data);
+                // Both decoded before any paint: `main_decoded`/`aux_decoded` are moved
+                // into this match, so the `_` arm below drops any `Ok` view (and its
+                // borrow of `main`/`aux`) before `reset()` needs mutable access again.
+                let (main_view, aux_view) = match (main_decoded, aux_decoded) {
+                    (Ok(m), Ok(a)) => (m, a),
+                    _ => {
+                        main.reset();
+                        aux.reset();
+                        let reason = if main_failed {
+                            "AVC444 main stream decode failed"
+                        } else {
+                            "AVC444 aux stream decode failed"
+                        };
+                        note_avc444_skip(&mut self.skipped_avc444, surface_id, reason);
+                        return Ok(());
+                    }
+                };
+
+                let (Ok(w), Ok(h)) = (usize::try_from(main_view.width), usize::try_from(main_view.height)) else {
+                    note_avc444_skip(&mut self.skipped_avc444, surface_id, "AVC444 main frame too large");
+                    return Ok(());
+                };
+                let _ = planes.resize_if_needed(w, h);
+
+                paint_avc444_rects(
+                    self.handler.as_mut(),
+                    &mut self.compositor,
+                    surface_id,
+                    codec_id,
+                    planes,
+                    rgba,
+                    &stream.stream1.rectangles,
+                    clip,
+                    |planes, rect| apply_main_view(planes, &main_view, rect),
+                );
+                *has_luma = true;
+
+                paint_avc444_rects(
+                    self.handler.as_mut(),
+                    &mut self.compositor,
+                    surface_id,
+                    codec_id,
+                    planes,
+                    rgba,
+                    &stream2.rectangles,
+                    clip,
+                    |planes, rect| apply_aux_view(planes, &aux_view, rect, layout),
+                );
+            }
+            Encoding::LUMA => {
+                let main_view = match main.decode_yuv(stream.stream1.data) {
+                    Ok(view) => view,
+                    Err(_) => {
+                        main.reset();
+                        aux.reset();
+                        note_avc444_skip(&mut self.skipped_avc444, surface_id, "AVC444 main stream decode failed");
+                        return Ok(());
+                    }
+                };
+
+                let (Ok(w), Ok(h)) = (usize::try_from(main_view.width), usize::try_from(main_view.height)) else {
+                    note_avc444_skip(&mut self.skipped_avc444, surface_id, "AVC444 main frame too large");
+                    return Ok(());
+                };
+                let _ = planes.resize_if_needed(w, h);
+
+                paint_avc444_rects(
+                    self.handler.as_mut(),
+                    &mut self.compositor,
+                    surface_id,
+                    codec_id,
+                    planes,
+                    rgba,
+                    &stream.stream1.rectangles,
+                    clip,
+                    |planes, rect| apply_main_view(planes, &main_view, rect),
+                );
+                *has_luma = true;
+            }
+            Encoding::CHROMA => {
+                if !*has_luma {
+                    main.reset();
+                    aux.reset();
+                    note_avc444_skip(&mut self.skipped_avc444, surface_id, "AVC444 chroma before any luma");
+                    return Ok(());
+                }
+
+                // LC=2: `stream1` carries the auxiliary bitstream (MS-RDPEGFX 2.2.4.5).
+                let aux_view = match aux.decode_yuv(stream.stream1.data) {
+                    Ok(view) => view,
+                    Err(_) => {
+                        main.reset();
+                        aux.reset();
+                        note_avc444_skip(&mut self.skipped_avc444, surface_id, "AVC444 aux stream decode failed");
+                        return Ok(());
+                    }
+                };
+
+                paint_avc444_rects(
+                    self.handler.as_mut(),
+                    &mut self.compositor,
+                    surface_id,
+                    codec_id,
+                    planes,
+                    rgba,
+                    &stream.stream1.rectangles,
+                    clip,
+                    |planes, rect| apply_aux_view(planes, &aux_view, rect, layout),
+                );
+            }
+            _ => {
+                // Unreachable today: `Avc444BitmapStream::decode` rejects any encoding
+                // value above 2. Kept as a safety net if that ever changes.
+                main.reset();
+                aux.reset();
+                note_avc444_skip(&mut self.skipped_avc444, surface_id, "unknown AVC444 encoding value");
+            }
+        }
+
+        Ok(())
+    }
+
     fn decode_clearcodec(
         &mut self,
         surface_id: u16,
@@ -1268,21 +1569,29 @@ impl DvcProcessor for GraphicsPipelineClient {
     }
 
     fn start(&mut self, _channel_id: u32) -> PduResult<Vec<DvcMessage>> {
-        let caps = if self.h264_decoder.is_some() {
+        let has_avc420 = self.h264_decoder.is_some();
+        let has_avc444 = self.avc444_decoders.is_some();
+
+        let caps = if has_avc420 && has_avc444 {
             self.handler.capabilities()
         } else {
-            // No H.264 decoder: filter out capability sets that imply AVC support.
-            // Only keep sets that work without a decoder (V8 without AVC flags).
+            // Missing decoder(s): filter out capability sets that imply support this
+            // client cannot actually decode. A set needs AVC420 for `avc420` and
+            // AVC444 for `avc444` (V10.x implies both), so each capability is kept
+            // only if the decoder it depends on is present.
             let filtered: Vec<CapabilitySet> = self
                 .handler
                 .capabilities()
                 .into_iter()
-                .filter(|cap| !CodecCapabilities::from_capability_set(cap).avc420)
+                .filter(|cap| {
+                    let codec_caps = CodecCapabilities::from_capability_set(cap);
+                    (has_avc420 || !codec_caps.avc420) && (has_avc444 || !codec_caps.avc444)
+                })
                 .collect();
 
             if filtered.is_empty() {
-                // All handler caps required AVC; fall back to V8-only
-                debug!("No H.264 decoder and all capabilities require AVC; falling back to V8");
+                // All handler caps required a missing decoder; fall back to V8-only.
+                debug!("No matching AVC decoder and all capabilities require one; falling back to V8");
                 vec![CapabilitySet::V8 {
                     flags: CapabilitiesV8Flags::SMALL_CACHE,
                 }]
@@ -1378,6 +1687,105 @@ fn convert_uncompressed_to_rgba(src: &[u8]) -> Vec<u8> {
         dst.extend_from_slice(&[r, g, b, 0xFF]);
     }
     dst
+}
+
+/// Count and log a skipped AVC444/AVC444v2 PDU. First skip logs at `warn`; every
+/// one after logs at `debug` with the running count — the same
+/// `skipped_wire_to_surface2` pattern `GraphicsPipelineClient` already uses for
+/// progressive decode failures: a decoder that fails once on a stream is
+/// overwhelmingly likely to keep failing on it, so only the first occurrence
+/// needs to be loud.
+///
+/// A plain function, not a `GraphicsPipelineClient` method: called from inside
+/// `decode_avc444` while other fields of `self` (the surface's decoders, planes)
+/// are already borrowed, and a `&mut self` method there would conflict.
+fn note_avc444_skip(skipped: &mut u32, surface_id: u16, reason: &str) {
+    *skipped = skipped.saturating_add(1);
+    if *skipped == 1 {
+        warn!(
+            surface_id,
+            reason, "AVC444 decode skipped; dropping this WireToSurface1 PDU"
+        );
+    } else {
+        debug!(
+            surface_id,
+            reason,
+            skipped_avc444 = *skipped,
+            "AVC444 decode skipped; dropping this WireToSurface1 PDU"
+        );
+    }
+}
+
+/// Reconstruct and paint every rectangle of one AVC444 sub-stream (main or aux).
+///
+/// For each `rects` entry (already-exclusive surface coordinates, MS-RDPEGFX
+/// 2.2.1.4.1): clip to `clip` (surface bounds intersected with `dest_rect`), run
+/// `apply` (either [`apply_main_view`] or [`apply_aux_view`], bound to the decoded
+/// view) to reconstruct that rect of `planes`, convert to RGBA, and paint — an
+/// empty clipped rect is skipped entirely (no update). A plain function, not a
+/// `GraphicsPipelineClient` method, for the same borrow-splitting reason as
+/// [`note_avc444_skip`]: `planes`/`rgba` are already borrowed out of the surface
+/// state when this runs.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each parameter is a distinct disjoint borrow of self's fields"
+)]
+fn paint_avc444_rects<F>(
+    handler: &mut dyn GraphicsPipelineHandler,
+    compositor: &mut Compositor,
+    surface_id: u16,
+    codec_id: Codec1Type,
+    planes: &mut Yuv444Planes,
+    rgba: &mut Vec<u8>,
+    rects: &[ExclusiveRectangle],
+    clip: PlaneRect,
+    mut apply: F,
+) where
+    F: FnMut(&mut Yuv444Planes, PlaneRect),
+{
+    for rect in rects {
+        let plane_rect = PlaneRect::from(rect).intersect(&clip);
+        if plane_rect.is_empty() {
+            continue;
+        }
+
+        apply(planes, plane_rect);
+        let clipped = convert_rect_to_rgba(planes, plane_rect, rgba);
+        if clipped.is_empty() {
+            continue;
+        }
+        debug_assert_eq!(rgba.len(), clipped.width() * clipped.height() * 4);
+
+        let Ok(left) = u16::try_from(clipped.left) else {
+            continue;
+        };
+        let Ok(top) = u16::try_from(clipped.top) else { continue };
+        let Ok(right) = u16::try_from(clipped.right) else {
+            continue;
+        };
+        let Ok(bottom) = u16::try_from(clipped.bottom) else {
+            continue;
+        };
+        let destination_rectangle = ExclusiveRectangle {
+            left,
+            top,
+            right,
+            bottom,
+        };
+        let width = right - left;
+        let height = bottom - top;
+
+        compositor.apply_bitmap(surface_id, &destination_rectangle, rgba);
+        let update = BitmapUpdate {
+            surface_id,
+            destination_rectangle,
+            codec_id,
+            data: core::mem::take(rgba),
+            width,
+            height,
+        };
+        handler.on_bitmap_updated(&update);
+    }
 }
 
 /// Crop a decoded RGBA frame to target dimensions

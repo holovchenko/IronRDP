@@ -279,6 +279,20 @@ impl Yuv444Planes {
         *self = Self::new(width, height);
         true
     }
+
+    /// Build directly from full `width x height` plane data. Test-fixture
+    /// constructor (`pub` for the same reason [`split`] is: `ironrdp-testsuite-core`
+    /// needs a ground-truth 4:4:4 source to split into main/aux streams and check
+    /// the reconstruction against). Panics if any plane's length doesn't match
+    /// `width * height`.
+    #[doc(hidden)]
+    pub fn from_planes(width: usize, height: usize, y: Vec<u8>, u: Vec<u8>, v: Vec<u8>) -> Self {
+        let len = width.checked_mul(height).expect("width * height overflow");
+        assert_eq!(y.len(), len, "y plane length must be width * height");
+        assert_eq!(u.len(), len, "u plane length must be width * height");
+        assert_eq!(v.len(), len, "v plane length must be width * height");
+        Self { width, height, y, u, v }
+    }
 }
 
 /// Which auxiliary-view layout produced a decoded stream: AVC444 (per
