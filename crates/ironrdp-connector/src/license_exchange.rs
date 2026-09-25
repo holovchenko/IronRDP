@@ -270,9 +270,7 @@ impl Sequence for LicenseExchangeSequence {
 
                                     (
                                         Written::from_size(written)?,
-                                        LicenseExchangeState::PlatformChallenge {
-                                            encryption_data,
-                                        },
+                                        LicenseExchangeState::PlatformChallenge { encryption_data },
                                     )
                                 }
                                 Err(err) => {
@@ -301,9 +299,7 @@ impl Sequence for LicenseExchangeSequence {
 
                                     (
                                         Written::from_size(written)?,
-                                        LicenseExchangeState::PlatformChallenge {
-                                            encryption_data,
-                                        },
+                                        LicenseExchangeState::PlatformChallenge { encryption_data },
                                     )
                                 }
                                 Err(error) => {

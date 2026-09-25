@@ -404,7 +404,7 @@ impl Compositor {
                 cache_slot,
                 src_left = src_rect.left,
                 src_top = src_rect.top,
-                "SurfaceToCache clamped to an empty tile — the slot will paint nothing"
+                "SurfaceToCache clamped to an empty tile -- the slot will paint nothing"
             );
         }
 
@@ -453,7 +453,7 @@ impl Compositor {
             // region simply keeps whatever it held. Diagnosing that needs a line.
             debug!(
                 cache_slot,
-                surface_id, "CacheToSurface on an empty cache slot — nothing painted"
+                surface_id, "CacheToSurface on an empty cache slot -- nothing painted"
             );
             return;
         };

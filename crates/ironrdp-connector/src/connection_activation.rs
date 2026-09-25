@@ -750,20 +750,21 @@ impl Sequence for ConnectionActivationSequence {
                 // to do with an undeferred incoming PDU and would make this
                 // diagnostic misattribute an encode bug as "not deferring a
                 // PDU received".
-                let written = connection_finalization.step(input, received_at, output).map_err(|e| {
-                    if matches!(e.kind(), crate::ConnectorErrorKind::Decode(_)) {
-                        if let Some(reason) = self.classify_declined_defer(input) {
-                            let prefix_len = input.len().min(16);
-                            warn!(
-                                ?reason,
-                                len = input.len(),
-                                prefix = %hex_prefix(&input[..prefix_len]),
-                                "Not deferring a PDU received during connection finalization"
-                            );
+                let written = connection_finalization
+                    .step(input, received_at, output)
+                    .inspect_err(|e| {
+                        if matches!(e.kind(), crate::ConnectorErrorKind::Decode(_)) {
+                            if let Some(reason) = self.classify_declined_defer(input) {
+                                let prefix_len = input.len().min(16);
+                                warn!(
+                                    ?reason,
+                                    len = input.len(),
+                                    prefix = %hex_prefix(&input[..prefix_len]),
+                                    "Not deferring a PDU received during connection finalization"
+                                );
+                            }
                         }
-                    }
-                    e
-                })?;
+                    })?;
 
                 let next_state = if !connection_finalization.state.is_terminal() {
                     ConnectionActivationState::ConnectionFinalization {
@@ -1095,7 +1096,7 @@ fn requested_bitmap_color_depth(bitmap: Option<&crate::BitmapConfig>) -> Connect
 /// new dependency here would have to be justified against upstream on every
 /// rebase.
 fn hex_prefix(bytes: &[u8]) -> String {
-    use std::fmt::Write as _;
+    use core::fmt::Write as _;
     let mut s = String::with_capacity(bytes.len() * 2);
     for b in bytes {
         let _ = write!(s, "{b:02x}");

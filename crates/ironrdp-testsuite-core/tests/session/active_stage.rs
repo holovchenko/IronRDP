@@ -7,7 +7,7 @@
 //! modules there never run under `cargo test --workspace --locked`. These tests
 //! live here instead so they actually execute in CI.
 
-use std::any::TypeId;
+use core::any::TypeId;
 
 use ironrdp_core::encode_vec;
 use ironrdp_dvc::DrdynvcClient;

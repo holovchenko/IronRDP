@@ -2290,8 +2290,14 @@ mod tests {
     #[test]
     fn graphics_pipeline_early_capability_follows_config() {
         let config = test_config(true);
-        let blocks = create_gcc_blocks(&config, None, nego::SecurityProtocol::HYBRID_EX, false, core::iter::empty())
-            .expect("valid GCC blocks");
+        let blocks = create_gcc_blocks(
+            &config,
+            None,
+            nego::SecurityProtocol::HYBRID_EX,
+            false,
+            core::iter::empty(),
+        )
+        .expect("valid GCC blocks");
         let early_capability_flags = blocks
             .core
             .optional_data
@@ -2301,8 +2307,14 @@ mod tests {
         assert!(early_capability_flags.contains(gcc::ClientEarlyCapabilityFlags::SUPPORT_NET_CHAR_AUTODETECT));
 
         let config = test_config(false);
-        let blocks = create_gcc_blocks(&config, None, nego::SecurityProtocol::HYBRID_EX, false, core::iter::empty())
-            .expect("valid GCC blocks");
+        let blocks = create_gcc_blocks(
+            &config,
+            None,
+            nego::SecurityProtocol::HYBRID_EX,
+            false,
+            core::iter::empty(),
+        )
+        .expect("valid GCC blocks");
         let early_capability_flags = blocks
             .core
             .optional_data
