@@ -54,6 +54,7 @@
 //! [3.3.5.12]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpegfx/e3c80bff-3e4e-4e65-b7c2-c2cd6b1fb4f5
 
 use std::collections::BTreeMap;
+use std::collections::btree_map::Entry;
 
 use ironrdp_core::{Decode as _, ReadCursor, impl_as_any};
 use ironrdp_dvc::{DvcClientProcessor, DvcMessage, DvcProcessor};
@@ -127,8 +128,6 @@ struct Avc444Surface {
     /// Whether a main-view update has ever landed, so a chroma-only (`LC=2`)
     /// update arriving before any luma has something to combine with.
     has_luma: bool,
-    /// Scratch RGBA buffer reused across [`convert_rect_to_rgba`] calls.
-    rgba: Vec<u8>,
 }
 
 // ============================================================================
@@ -1229,43 +1228,6 @@ impl GraphicsPipelineClient {
             }
         };
 
-        if !self.avc444_surfaces.contains_key(&surface_id) {
-            let Some(factory) = self.avc444_decoders.as_ref() else {
-                note_avc444_skip(
-                    &mut self.skipped_avc444,
-                    surface_id,
-                    "no AVC444 decoder factory configured",
-                );
-                return Ok(());
-            };
-            let Some(main) = factory() else {
-                note_avc444_skip(
-                    &mut self.skipped_avc444,
-                    surface_id,
-                    "AVC444 decoder factory returned no main decoder",
-                );
-                return Ok(());
-            };
-            let Some(aux) = factory() else {
-                note_avc444_skip(
-                    &mut self.skipped_avc444,
-                    surface_id,
-                    "AVC444 decoder factory returned no aux decoder",
-                );
-                return Ok(());
-            };
-            self.avc444_surfaces.insert(
-                surface_id,
-                Avc444Surface {
-                    main,
-                    aux,
-                    planes: Yuv444Planes::new(0, 0),
-                    has_luma: false,
-                    rgba: Vec::new(),
-                },
-            );
-        }
-
         let layout = if codec_id == Codec1Type::Avc444v2 {
             ChromaLayout::V2
         } else {
@@ -1280,16 +1242,46 @@ impl GraphicsPipelineClient {
             bottom: usize::from(surface_height),
         });
 
-        let state = self
-            .avc444_surfaces
-            .get_mut(&surface_id)
-            .expect("just checked or inserted above");
+        let state = match self.avc444_surfaces.entry(surface_id) {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => {
+                let Some(factory) = self.avc444_decoders.as_ref() else {
+                    note_avc444_skip(
+                        &mut self.skipped_avc444,
+                        surface_id,
+                        "no AVC444 decoder factory configured",
+                    );
+                    return Ok(());
+                };
+                let Some(main) = factory() else {
+                    note_avc444_skip(
+                        &mut self.skipped_avc444,
+                        surface_id,
+                        "AVC444 decoder factory returned no main decoder",
+                    );
+                    return Ok(());
+                };
+                let Some(aux) = factory() else {
+                    note_avc444_skip(
+                        &mut self.skipped_avc444,
+                        surface_id,
+                        "AVC444 decoder factory returned no aux decoder",
+                    );
+                    return Ok(());
+                };
+                entry.insert(Avc444Surface {
+                    main,
+                    aux,
+                    planes: Yuv444Planes::new(0, 0),
+                    has_luma: false,
+                })
+            }
+        };
         let Avc444Surface {
             main,
             aux,
             planes,
             has_luma,
-            rgba,
         } = state;
 
         match stream.encoding {
@@ -1328,7 +1320,14 @@ impl GraphicsPipelineClient {
                     note_avc444_skip(&mut self.skipped_avc444, surface_id, "AVC444 main frame too large");
                     return Ok(());
                 };
-                let _ = planes.resize_if_needed(w, h);
+                // A resize wipes `planes` back to defaults (Y=0, U=V=128); the luma
+                // just decoded is repainted into it right below, but any aux-carried
+                // chroma from before the resize is gone, so `has_luma` must not still
+                // claim there is something for a later chroma-only update to combine
+                // with until this PDU's own luma rects (if any) land.
+                if planes.resize_if_needed(w, h) {
+                    *has_luma = false;
+                }
 
                 paint_avc444_rects(
                     self.handler.as_mut(),
@@ -1336,12 +1335,13 @@ impl GraphicsPipelineClient {
                     surface_id,
                     codec_id,
                     planes,
-                    rgba,
                     &stream.stream1.rectangles,
                     clip,
                     |planes, rect| apply_main_view(planes, &main_view, rect),
                 );
-                *has_luma = true;
+                if !stream.stream1.rectangles.is_empty() {
+                    *has_luma = true;
+                }
 
                 paint_avc444_rects(
                     self.handler.as_mut(),
@@ -1349,7 +1349,6 @@ impl GraphicsPipelineClient {
                     surface_id,
                     codec_id,
                     planes,
-                    rgba,
                     &stream2.rectangles,
                     clip,
                     |planes, rect| apply_aux_view(planes, &aux_view, rect, layout),
@@ -1370,7 +1369,11 @@ impl GraphicsPipelineClient {
                     note_avc444_skip(&mut self.skipped_avc444, surface_id, "AVC444 main frame too large");
                     return Ok(());
                 };
-                let _ = planes.resize_if_needed(w, h);
+                // See the LC=0 branch above: a resize invalidates the previously
+                // combined chroma, so `has_luma` must not survive it unearned.
+                if planes.resize_if_needed(w, h) {
+                    *has_luma = false;
+                }
 
                 paint_avc444_rects(
                     self.handler.as_mut(),
@@ -1378,12 +1381,13 @@ impl GraphicsPipelineClient {
                     surface_id,
                     codec_id,
                     planes,
-                    rgba,
                     &stream.stream1.rectangles,
                     clip,
                     |planes, rect| apply_main_view(planes, &main_view, rect),
                 );
-                *has_luma = true;
+                if !stream.stream1.rectangles.is_empty() {
+                    *has_luma = true;
+                }
             }
             Encoding::CHROMA => {
                 if !*has_luma {
@@ -1410,7 +1414,6 @@ impl GraphicsPipelineClient {
                     surface_id,
                     codec_id,
                     planes,
-                    rgba,
                     &stream.stream1.rectangles,
                     clip,
                     |planes, rect| apply_aux_view(planes, &aux_view, rect, layout),
@@ -1724,8 +1727,10 @@ fn note_avc444_skip(skipped: &mut u32, surface_id: u16, reason: &str) {
 /// view) to reconstruct that rect of `planes`, convert to RGBA, and paint — an
 /// empty clipped rect is skipped entirely (no update). A plain function, not a
 /// `GraphicsPipelineClient` method, for the same borrow-splitting reason as
-/// [`note_avc444_skip`]: `planes`/`rgba` are already borrowed out of the surface
-/// state when this runs.
+/// [`note_avc444_skip`]: `planes` is already borrowed out of the surface state
+/// when this runs. `BitmapUpdate.data` is an owned `Vec<u8>` the caller keeps, so
+/// each painted rect allocates its own RGBA buffer here rather than reusing one
+/// across calls.
 #[expect(
     clippy::too_many_arguments,
     reason = "each parameter is a distinct disjoint borrow of self's fields"
@@ -1736,7 +1741,6 @@ fn paint_avc444_rects<F>(
     surface_id: u16,
     codec_id: Codec1Type,
     planes: &mut Yuv444Planes,
-    rgba: &mut Vec<u8>,
     rects: &[ExclusiveRectangle],
     clip: PlaneRect,
     mut apply: F,
@@ -1750,7 +1754,8 @@ fn paint_avc444_rects<F>(
         }
 
         apply(planes, plane_rect);
-        let clipped = convert_rect_to_rgba(planes, plane_rect, rgba);
+        let mut rgba = Vec::new();
+        let clipped = convert_rect_to_rgba(planes, plane_rect, &mut rgba);
         if clipped.is_empty() {
             continue;
         }
@@ -1775,12 +1780,12 @@ fn paint_avc444_rects<F>(
         let width = right - left;
         let height = bottom - top;
 
-        compositor.apply_bitmap(surface_id, &destination_rectangle, rgba);
+        compositor.apply_bitmap(surface_id, &destination_rectangle, &rgba);
         let update = BitmapUpdate {
             surface_id,
             destination_rectangle,
             codec_id,
-            data: core::mem::take(rgba),
+            data: rgba,
             width,
             height,
         };

@@ -942,3 +942,104 @@ fn factory_returning_none_skips_without_error() {
 
     assert_eq!(painted_count(&recorder, 1), 0);
 }
+
+// ============================================================================
+// Fixup: a plane resize must not let a stale `has_luma` survive it
+// ============================================================================
+
+#[test]
+fn a_frame_size_change_resets_the_luma_state() {
+    // Positive: LC=1 at 32x32, then LC=1 at 48x48 (a genuine resize with a
+    // non-empty luma rect list), then LC=2 must still paint — the resize's own
+    // luma rects re-earn `has_luma` within that same PDU.
+    let (src32, _y32, _u32, _v32) = two_level_source(32, 32, 10);
+    let (src48, y48, u48, v48) = two_level_source(48, 48, 11);
+    let main_frame_32 = split::main_view(&src32);
+    let main_frame_48 = split::main_view(&src48);
+    let aux_frame_48 = split::aux_view(&src48, ChromaLayout::V1);
+
+    let main_counters = Arc::new(Mutex::new(DecoderCounters::default()));
+    let aux_counters = Arc::new(Mutex::new(DecoderCounters::default()));
+    let factory_calls = Arc::new(Mutex::new(0u32));
+    let main: Box<dyn H264YuvDecoder> = Box::new(MockYuvDecoder::new(
+        vec![main_frame_32, main_frame_48],
+        &[],
+        Arc::clone(&main_counters),
+    ));
+    let aux: Box<dyn H264YuvDecoder> =
+        Box::new(MockYuvDecoder::new(vec![aux_frame_48], &[], Arc::clone(&aux_counters)));
+    let factory = queued_factory(vec![main, aux], factory_calls);
+    let (mut client, recorder) = setup_active_client(Some(factory), 1, 48, 48);
+
+    send_avc444(
+        &mut client,
+        1,
+        Codec1Type::Avc444,
+        full_rect(32, 32),
+        Encoding::LUMA,
+        avc420_stream(vec![full_rect(32, 32)], &[0x00, 0x00, 0x00, 0x01, 0x67]),
+        None,
+    )
+    .expect("first LC=1 (32x32) should succeed");
+
+    send_avc444(
+        &mut client,
+        1,
+        Codec1Type::Avc444,
+        full_rect(48, 48),
+        Encoding::LUMA,
+        avc420_stream(vec![full_rect(48, 48)], &[0x00, 0x00, 0x00, 0x01, 0x67]),
+        None,
+    )
+    .expect("second LC=1 (48x48, a resize) should succeed");
+
+    send_avc444(
+        &mut client,
+        1,
+        Codec1Type::Avc444,
+        full_rect(48, 48),
+        Encoding::CHROMA,
+        avc420_stream(vec![full_rect(48, 48)], &[0x00, 0x00, 0x00, 0x01, 0x68]),
+        None,
+    )
+    .expect("LC=2 after the resize should still paint");
+
+    let (_, _, data) = last_painted(&recorder, 1);
+    assert_eq!(data, direct_rgba(48, 48, &y48, &u48, &v48));
+
+    // Negative: a resize whose luma PDU carries an EMPTY rect list must not
+    // re-earn `has_luma` — a following LC=2 must still hit the
+    // chroma-before-luma guard and reset both decoders.
+    let (src16, _, _, _) = two_level_source(16, 16, 12);
+    let main_frame_16 = split::main_view(&src16);
+    let decoders2 = mock_decoders(vec![main_frame_16], vec![], &[], &[]);
+    let main_counters2 = Arc::clone(&decoders2.main_counters);
+    let aux_counters2 = Arc::clone(&decoders2.aux_counters);
+    let (mut client2, recorder2) = setup_active_client(Some(decoders2.factory), 2, 16, 16);
+
+    send_avc444(
+        &mut client2,
+        2,
+        Codec1Type::Avc444,
+        full_rect(16, 16),
+        Encoding::LUMA,
+        avc420_stream(vec![], &[0x00, 0x00, 0x00, 0x01, 0x67]),
+        None,
+    )
+    .expect("LC=1 with an empty rect list should still succeed");
+
+    send_avc444(
+        &mut client2,
+        2,
+        Codec1Type::Avc444,
+        full_rect(16, 16),
+        Encoding::CHROMA,
+        avc420_stream(vec![full_rect(16, 16)], &[0x00, 0x00, 0x00, 0x01, 0x68]),
+        None,
+    )
+    .expect("LC=2 must be skipped, not errored");
+
+    assert_eq!(painted_count(&recorder2, 2), 0, "nothing should be painted");
+    assert_eq!(main_counters2.lock().unwrap().reset_calls, 1);
+    assert_eq!(aux_counters2.lock().unwrap().reset_calls, 1);
+}

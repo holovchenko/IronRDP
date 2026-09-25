@@ -47,6 +47,7 @@ pub mod color {
 
     /// `R = (256*Y + 403*(V-128)) >> 8`, `G = (256*Y - 48*(U-128) - 120*(V-128)) >> 8`,
     /// `B = (256*Y + 475*(U-128)) >> 8`, each clamped to `0..=255`.
+    #[inline]
     pub fn yuv_to_rgb(y: u8, u: u8, v: u8) -> [u8; 3] {
         let y = i32::from(y);
         let u = i32::from(u) - 128;
@@ -62,6 +63,7 @@ pub mod color {
     /// Encoder-side forward transform (used by tests and [`super::split`] fixtures):
     /// `Y = (54R + 183G + 18B) >> 8`, `U = ((-29R - 99G + 128B) >> 8) + 128`,
     /// `V = ((128R - 116G - 12B) >> 8) + 128`, each clamped to `0..=255`.
+    #[inline]
     pub fn rgb_to_yuv(r: u8, g: u8, b: u8) -> [u8; 3] {
         let r = i32::from(r);
         let g = i32::from(g);
@@ -79,6 +81,7 @@ pub mod color {
     /// `a0_rev = 4*filtered - a - b - c`. The comparison against
     /// [`REVERSE_FILTER_THRESHOLD`] uses the *unclamped* `a0_rev`; only the
     /// chosen value is clamped to `0..=255`.
+    #[inline]
     pub fn reverse_filter(filtered: u8, a: u8, b: u8, c: u8) -> u8 {
         let filtered_i = i32::from(filtered);
         let reversed = 4 * filtered_i - i32::from(a) - i32::from(b) - i32::from(c);
@@ -1046,8 +1049,12 @@ mod tests {
             for x in 0..width {
                 let idx = y * width + x;
                 planes.y[idx] = u8::try_from(((x + y) * 2) & 0xFF).unwrap_or(0);
-                planes.u[idx] = if lcg_next(&mut state) & 1 == 0 { 40 } else { 200 };
-                planes.v[idx] = if lcg_next(&mut state) & 1 == 0 { 40 } else { 200 };
+                // Bit 0 of this LCG strictly alternates every step (odd multiplier,
+                // odd increment), which would make an `& 1` extraction a call-count
+                // invariant here (two draws per pixel) instead of pseudo-random. Use
+                // a high bit instead.
+                planes.u[idx] = if (lcg_next(&mut state) >> 32) & 1 == 0 { 40 } else { 200 };
+                planes.v[idx] = if (lcg_next(&mut state) >> 32) & 1 == 0 { 40 } else { 200 };
             }
         }
         planes
