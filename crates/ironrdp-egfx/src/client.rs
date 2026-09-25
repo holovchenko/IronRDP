@@ -639,9 +639,10 @@ impl GraphicsPipelineClient {
 
             // Surface operations
             GfxPdu::SolidFill(pdu) => {
-                trace!(
+                debug!(
                     surface_id = pdu.surface_id,
                     rectangles = ?pdu.rectangles,
+                    fill_pixel = ?pdu.fill_pixel,
                     "SolidFill"
                 );
                 self.compositor
@@ -1023,7 +1024,7 @@ impl GraphicsPipelineClient {
                 bottom: tile_top + tile_height,
             };
             let mut emit_update = |destination_rectangle: ExclusiveRectangle, data: Vec<u8>| {
-                trace!(
+                debug!(
                     surface_id = pdu.surface_id,
                     ?destination_rectangle,
                     "WireToSurface2 tile painted"
