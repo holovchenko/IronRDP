@@ -231,6 +231,45 @@ pub struct BitmapUpdate {
     pub height: u16,
 }
 
+/// Most entries one `RDPGFX_CACHE_IMPORT_OFFER_PDU` may carry.
+///
+/// MS-RDPEGFX 2.2.2.16: `cacheEntriesCount` "MUST be less than 5462"; FreeRDP caps its
+/// offer at the same 5461.
+pub const MAX_CACHE_IMPORT_ENTRIES: usize = 5461;
+
+/// Most pixel bytes one offer may carry: the 100 MB bitmap cache of MS-RDPEGFX 3.3.1.4,
+/// whose in-use slots "MUST NOT exceed the total size of the cache".
+pub const MAX_CACHE_IMPORT_BYTES: usize = 100 * 1024 * 1024;
+
+/// A tile kept from an earlier session, offered to the server in `CacheImportOffer`.
+///
+/// The handler must hand over only tiles it has already verified (decrypted and
+/// authenticated): once the server accepts an entry it paints from that slot, and no
+/// PDU lets the client withdraw it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CacheImportTile {
+    /// The server's key from the `SurfaceToCache` that produced the tile.
+    pub cache_key: u64,
+    pub width: u16,
+    pub height: u16,
+    /// RGBA8888, exactly `width * height * 4` bytes.
+    pub data: Vec<u8>,
+}
+
+/// What a `CacheImportReply` did to the bitmap cache.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct CacheImportOutcome {
+    /// Entries in the offer the reply answered.
+    pub offered: usize,
+    /// `(cache_key, cache_slot)` for every offered tile now in the cache.
+    pub imported: Vec<(u64, u16)>,
+    /// Slots the reply names that the client could not fill: an index past the offer,
+    /// a reply with no offer staged, or a slot named twice. The server paints from these
+    /// believing they are filled, so a non-empty list needs recovery (a full refresh).
+    pub unfilled_slots: Vec<u16>,
+}
+
 // ============================================================================
 // Codec Processed
 // ============================================================================
