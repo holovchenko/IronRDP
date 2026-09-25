@@ -16,12 +16,13 @@
 //! [`BitmapUpdate`](crate::client::BitmapUpdate) and the session's decoded image,
 //! so a drained region is ready to blit without conversion.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use ironrdp_pdu::geometry::ExclusiveRectangle;
 use tracing::{debug, trace};
 
-use crate::pdu::{Color, Point};
+use crate::client::{CacheImportOutcome, CacheImportTile, MAX_CACHE_IMPORT_BYTES, MAX_CACHE_IMPORT_ENTRIES};
+use crate::pdu::{CacheEntryMetadata, Color, Point};
 
 const BYTES_PER_PIXEL: usize = 4;
 
@@ -122,6 +123,13 @@ struct CachedTile {
     data: Vec<u8>,
 }
 
+/// A tile held for a pending `CacheImportOffer`, already charged against the budget.
+#[derive(Debug)]
+struct StagedTile {
+    cache_key: u64,
+    tile: CachedTile,
+}
+
 /// Client-side EGFX surface compositor.
 ///
 /// Applies surface commands into persistent RGBA8888 buffers and accumulates the
@@ -132,9 +140,12 @@ struct CachedTile {
 pub(crate) struct Compositor {
     surfaces: BTreeMap<u16, Surface>,
     cache: BTreeMap<u16, CachedTile>,
-    /// Pixel bytes currently held across `surfaces`, `cache` and `ready`, charged
-    /// against [`MAX_COMPOSITOR_BYTES`]. Kept as a running total rather than
-    /// recomputed so the check before an allocation stays O(1).
+    /// Tiles offered in `CacheImportOffer`, in offer order, awaiting the reply.
+    /// `None` once the reply has moved the tile into a slot.
+    staged_import: Vec<Option<StagedTile>>,
+    /// Pixel bytes currently held across `surfaces`, `cache`, `staged_import` and
+    /// `ready`, charged against [`MAX_COMPOSITOR_BYTES`]. Kept as a running total
+    /// rather than recomputed so the check before an allocation stays O(1).
     allocated_bytes: usize,
     output_width: u16,
     output_height: u16,
@@ -404,7 +415,7 @@ impl Compositor {
                 cache_slot,
                 src_left = src_rect.left,
                 src_top = src_rect.top,
-                "SurfaceToCache clamped to an empty tile — the slot will paint nothing"
+                "SurfaceToCache clamped to an empty tile - the slot will paint nothing"
             );
         }
 
@@ -453,7 +464,7 @@ impl Compositor {
             // region simply keeps whatever it held. Diagnosing that needs a line.
             debug!(
                 cache_slot,
-                surface_id, "CacheToSurface on an empty cache slot — nothing painted"
+                surface_id, "CacheToSurface on an empty cache slot - nothing painted"
             );
             return;
         };
@@ -478,6 +489,142 @@ impl Compositor {
         if let Some(tile) = self.cache.remove(&cache_slot) {
             self.release(tile.data.len());
         }
+    }
+
+    /// Hold `tiles` for a `CacheImportOffer` and return the offer's entries, in order.
+    ///
+    /// Every staged tile is charged here, before the offer exists. A slot the server
+    /// believes filled but the client left empty paints nothing on every later
+    /// `CacheToSurface` (the stale-mosaic class), and no PDU lets the client withdraw an
+    /// entry the server accepted — so the budget must say no now, while saying no only
+    /// shortens the offer. Staging stops at the first tile the entry cap, the byte cap or
+    /// the budget refuses, keeping the offer a prefix of `tiles` (the reply answers a
+    /// prefix too, MS-RDPEGFX 2.2.2.17). Malformed tiles (zero-sized, or `data` not
+    /// `width * height * 4` bytes) and repeated keys are skipped. Anything staged
+    /// earlier is released first.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "stage_import/commit_import/discard_import/cache_tile are wired up by a later Tessera task; only tests call them so far"
+        )
+    )]
+    pub(crate) fn stage_import(&mut self, tiles: Vec<CacheImportTile>) -> Vec<CacheEntryMetadata> {
+        self.discard_import();
+        let mut entries = Vec::new();
+        let mut keys = BTreeSet::new();
+        let mut total = 0usize;
+        for tile in tiles {
+            if entries.len() == MAX_CACHE_IMPORT_ENTRIES {
+                break;
+            }
+            let len = usize::from(tile.width) * usize::from(tile.height) * BYTES_PER_PIXEL;
+            if len == 0 || tile.data.len() != len || !keys.insert(tile.cache_key) {
+                debug!(
+                    cache_key = tile.cache_key,
+                    "skipping a malformed or repeated cache import tile"
+                );
+                continue;
+            }
+            #[expect(
+                clippy::arithmetic_side_effects,
+                reason = "total is bounded by MAX_CACHE_IMPORT_BYTES via the check below every iteration"
+            )]
+            let would_total = total + len;
+            if would_total > MAX_CACHE_IMPORT_BYTES || !self.charge(len) {
+                break;
+            }
+            total = would_total;
+            let Ok(bitmap_len) = u32::try_from(len) else {
+                // Unreachable: `len` is bounded by MAX_CACHE_IMPORT_BYTES. Release rather
+                // than unwrap, so an accounting slip cannot leak budget.
+                self.release(len);
+                break;
+            };
+            entries.push(CacheEntryMetadata {
+                cache_key: tile.cache_key,
+                bitmap_len,
+            });
+            self.staged_import.push(Some(StagedTile {
+                cache_key: tile.cache_key,
+                tile: CachedTile {
+                    width: tile.width,
+                    height: tile.height,
+                    data: tile.data,
+                },
+            }));
+        }
+        entries
+    }
+
+    /// Apply a `CacheImportReply`: `cache_slots[i]` is the slot the server assigned to
+    /// offer entry `i`, and `0` means "not imported" (FreeRDP's `gdi_ImportCacheEntry`).
+    ///
+    /// A named tile moves into its slot carrying the charge taken at staging, so
+    /// filling cannot be refused here. A slot named with no staged tile behind it — an
+    /// index past the offer, a reply with nothing staged, a slot named twice — cannot be
+    /// filled by anything the client holds and is reported in `unfilled_slots`. Every
+    /// staged tile the reply does not name is released.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "commit_import/cache_tile are wired up by a later Tessera task; only tests call them so far"
+        )
+    )]
+    pub(crate) fn commit_import(&mut self, cache_slots: &[u16]) -> CacheImportOutcome {
+        let mut staged = core::mem::take(&mut self.staged_import);
+        let mut outcome = CacheImportOutcome {
+            offered: staged.len(),
+            ..CacheImportOutcome::default()
+        };
+        let mut assigned = BTreeSet::new();
+        for (index, &slot) in cache_slots.iter().enumerate() {
+            if slot == 0 {
+                continue;
+            }
+            match staged.get_mut(index).and_then(Option::take) {
+                Some(StagedTile { cache_key, tile }) if assigned.insert(slot) => {
+                    if let Some(previous) = self.cache.remove(&slot) {
+                        self.release(previous.data.len());
+                    }
+                    self.cache.insert(slot, tile);
+                    outcome.imported.push((cache_key, slot));
+                }
+                Some(StagedTile { tile, .. }) => {
+                    // Two entries claim one slot; which one the server believes it holds
+                    // is unknowable, so the slot counts as unfilled.
+                    self.release(tile.data.len());
+                    outcome.unfilled_slots.push(slot);
+                }
+                None => outcome.unfilled_slots.push(slot),
+            }
+        }
+        for leftover in staged.into_iter().flatten() {
+            self.release(leftover.tile.data.len());
+        }
+        outcome
+    }
+
+    /// Release every staged import tile (channel closed, or a new offer replaces it).
+    pub(crate) fn discard_import(&mut self) {
+        for staged in core::mem::take(&mut self.staged_import).into_iter().flatten() {
+            self.release(staged.tile.data.len());
+        }
+    }
+
+    /// The tile in `cache_slot`, as `(width, height, rgba)`.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "cache_tile is wired up by a later Tessera task; only tests call it so far"
+        )
+    )]
+    pub(crate) fn cache_tile(&self, cache_slot: u16) -> Option<(u16, u16, &[u8])> {
+        self.cache
+            .get(&cache_slot)
+            .map(|tile| (tile.width, tile.height, tile.data.as_slice()))
     }
 
     /// Commit the current frame's deltas (`EndFrame`), making them drainable.
@@ -1690,5 +1837,183 @@ mod tests {
         // The surface itself survives the reset (MS-RDPEGFX 3.3.5.14), so its charge
         // remains; only the discarded queued delta's charge is released.
         assert_eq!(c.allocated_bytes, surface_only);
+    }
+
+    fn tile(cache_key: u64, width: u16, height: u16, fill: u8) -> CacheImportTile {
+        CacheImportTile {
+            cache_key,
+            width,
+            height,
+            data: vec![fill; usize::from(width) * usize::from(height) * BYTES_PER_PIXEL],
+        }
+    }
+
+    /// Staging charges every staged tile and offers them in the order given, with
+    /// `bitmap_len = width * height * 4`.
+    #[test]
+    fn staged_import_is_charged_and_offered_in_order() {
+        let mut c = Compositor::default();
+        let entries = c.stage_import(vec![tile(10, 2, 2, 1), tile(20, 3, 1, 2), tile(30, 1, 1, 3)]);
+        let offered: Vec<(u64, u32)> = entries.iter().map(|e| (e.cache_key, e.bitmap_len)).collect();
+        assert_eq!(offered, vec![(10, 16), (20, 12), (30, 4)]);
+        assert_eq!(c.allocated_bytes, 16 + 12 + 4);
+    }
+
+    #[test]
+    fn staging_skips_malformed_and_repeated_tiles() {
+        let mut c = Compositor::default();
+        let mut short = tile(11, 2, 2, 1);
+        short.data.pop();
+        let entries = c.stage_import(vec![
+            short,
+            tile(12, 0, 4, 1),
+            tile(13, 1, 1, 1),
+            tile(13, 1, 1, 9),
+            tile(14, 1, 1, 1),
+        ]);
+        let keys: Vec<u64> = entries.iter().map(|e| e.cache_key).collect();
+        assert_eq!(keys, vec![13, 14]);
+        assert_eq!(c.allocated_bytes, 4 + 4);
+    }
+
+    #[test]
+    fn staging_stops_at_the_entry_cap() {
+        let mut c = Compositor::default();
+        let tiles = (0..u64::try_from(MAX_CACHE_IMPORT_ENTRIES + 3).unwrap())
+            .map(|k| tile(k + 1, 1, 1, 1))
+            .collect();
+        assert_eq!(c.stage_import(tiles).len(), MAX_CACHE_IMPORT_ENTRIES);
+    }
+
+    #[test]
+    fn staging_stops_at_the_byte_cap() {
+        const EDGE: u16 = 2048; // 16 MiB per tile
+        let per_tile = usize::from(EDGE) * usize::from(EDGE) * BYTES_PER_PIXEL;
+        let fit = MAX_CACHE_IMPORT_BYTES / per_tile; // 6
+        let mut c = Compositor::default();
+        let tiles = (0..u64::try_from(fit + 1).unwrap())
+            .map(|k| tile(k + 1, EDGE, EDGE, 1))
+            .collect();
+        assert_eq!(c.stage_import(tiles).len(), fit);
+        assert_eq!(c.allocated_bytes, fit * per_tile);
+    }
+
+    /// The budget is checked before the offer exists: a tile the budget refuses is
+    /// never offered, so the reply can never name a slot the compositor then refuses.
+    #[test]
+    fn staging_stops_where_the_budget_refuses() {
+        const SURFACE_EDGE: u16 = 4096; // 64 MiB per surface
+        const TILE_EDGE: u16 = 2048; // 16 MiB per tile
+        let mut c = Compositor::default();
+        for id in 1..=3 {
+            c.create_surface(id, SURFACE_EDGE, SURFACE_EDGE);
+        }
+        let surfaces = 3 * usize::from(SURFACE_EDGE) * usize::from(SURFACE_EDGE) * BYTES_PER_PIXEL;
+        let per_tile = usize::from(TILE_EDGE) * usize::from(TILE_EDGE) * BYTES_PER_PIXEL;
+        let fit = (MAX_COMPOSITOR_BYTES - surfaces) / per_tile; // 4, below the byte cap's 6
+        let tiles = (0..6).map(|k| tile(k + 1, TILE_EDGE, TILE_EDGE, 1)).collect();
+        assert_eq!(c.stage_import(tiles).len(), fit);
+        assert_eq!(c.allocated_bytes, surfaces + fit * per_tile);
+    }
+
+    /// The reply fills exactly the slots it names, with the tile at the same offer
+    /// index, and releases every tile it does not name.
+    #[test]
+    fn commit_fills_exactly_the_named_slots() {
+        let mut c = Compositor::default();
+        c.stage_import(vec![tile(10, 2, 2, 0xA1), tile(20, 2, 2, 0xB2), tile(30, 1, 1, 0xC3)]);
+        let outcome = c.commit_import(&[5, 0, 9]);
+        assert_eq!(outcome.offered, 3);
+        assert_eq!(outcome.imported, vec![(10, 5), (30, 9)]);
+        assert!(outcome.unfilled_slots.is_empty());
+        assert_eq!(c.cache.keys().copied().collect::<Vec<_>>(), vec![5, 9]);
+        assert_eq!(c.cache_tile(5), Some((2, 2, &[0xA1; 16][..])));
+        assert_eq!(c.cache_tile(9), Some((1, 1, &[0xC3; 4][..])));
+        assert_eq!(c.allocated_bytes, 16 + 4, "the unnamed tile's charge must be released");
+    }
+
+    /// An imported tile paints through `CacheToSurface` like a tile the server cached
+    /// in this session.
+    #[test]
+    fn imported_tile_paints_through_cache_to_surface() {
+        let mut c = Compositor::default();
+        c.reset(16, 16);
+        c.create_surface(1, 16, 16);
+        c.map_surface(1, 0, 0);
+        c.end_frame();
+        let _ = c.drain_output();
+        c.stage_import(vec![tile(10, 2, 2, 0x7F)]);
+        c.commit_import(&[7]);
+        c.cache_to_surface(7, 1, &[Point { x: 4, y: 4 }]);
+        c.end_frame();
+        let updates = c.drain_output();
+        assert_eq!(updates.len(), 1);
+        assert_eq!((updates[0].region.left, updates[0].region.top), (4, 4));
+        assert_eq!(updates[0].data, vec![0x7F; 16]);
+    }
+
+    #[test]
+    fn commit_reports_slots_it_cannot_fill() {
+        let mut c = Compositor::default();
+        c.stage_import(vec![tile(10, 1, 1, 1)]);
+        let outcome = c.commit_import(&[4, 7]);
+        assert_eq!(outcome.imported, vec![(10, 4)]);
+        assert_eq!(outcome.unfilled_slots, vec![7]);
+        // A second reply has nothing staged behind it.
+        let again = c.commit_import(&[3]);
+        assert_eq!(again.offered, 0);
+        assert!(again.imported.is_empty());
+        assert_eq!(again.unfilled_slots, vec![3]);
+        assert_eq!(c.cache.keys().copied().collect::<Vec<_>>(), vec![4]);
+    }
+
+    #[test]
+    fn commit_reports_a_slot_named_twice() {
+        let mut c = Compositor::default();
+        c.stage_import(vec![tile(10, 1, 1, 1), tile(20, 1, 1, 2)]);
+        let outcome = c.commit_import(&[4, 4]);
+        assert_eq!(outcome.imported, vec![(10, 4)]);
+        assert_eq!(outcome.unfilled_slots, vec![4]);
+        assert_eq!(c.allocated_bytes, 4);
+    }
+
+    /// Importing into an occupied slot replaces the occupant and releases its charge.
+    #[test]
+    fn commit_replaces_an_occupied_slot() {
+        let mut c = Compositor::default();
+        c.create_surface(1, 8, 8);
+        c.surface_to_cache(1, 5, &rect(0, 0, 8, 8));
+        c.stage_import(vec![tile(10, 1, 1, 1)]);
+        c.commit_import(&[5]);
+        assert_eq!(c.allocated_bytes, 8 * 8 * BYTES_PER_PIXEL + 4);
+        assert_eq!(c.cache_tile(5), Some((1, 1, &[1u8; 4][..])));
+    }
+
+    #[test]
+    fn staged_import_survives_a_reset() {
+        let mut c = Compositor::default();
+        c.reset(100, 100);
+        c.stage_import(vec![tile(10, 1, 1, 1)]);
+        c.reset(200, 150);
+        assert_eq!(c.commit_import(&[3]).imported, vec![(10, 3)]);
+    }
+
+    #[test]
+    fn discard_releases_the_staged_charge() {
+        let mut c = Compositor::default();
+        c.stage_import(vec![tile(10, 2, 2, 1), tile(20, 1, 1, 1)]);
+        c.discard_import();
+        assert_eq!(c.allocated_bytes, 0);
+        let outcome = c.commit_import(&[1, 2]);
+        assert!(outcome.imported.is_empty());
+        assert_eq!(outcome.unfilled_slots, vec![1, 2]);
+    }
+
+    /// A tile the budget refuses leaves no tile behind for `cache_tile` to report.
+    #[test]
+    fn a_refused_surface_to_cache_leaves_no_tile() {
+        let mut c = Compositor::default();
+        c.surface_to_cache(99, 5, &rect(0, 0, 8, 8)); // no such surface
+        assert_eq!(c.cache_tile(5), None);
     }
 }
