@@ -6,8 +6,9 @@ use ironrdp_egfx::client::{
 use ironrdp_egfx::decode::{DecodedFrame, DecoderResult, H264Decoder};
 use ironrdp_egfx::pdu::{
     CapabilitiesAdvertisePdu, CapabilitiesConfirmPdu, CapabilitiesV8Flags, CapabilitySet, CapabilityVersion,
-    Codec1Type, Codec2Type, Color, CreateSurfacePdu, DeleteSurfacePdu, EndFramePdu, GfxPdu, MapSurfaceToOutputPdu,
-    PixelFormat, ResetGraphicsPdu, SolidFillPdu, StartFramePdu, Timestamp, WireToSurface1Pdu, WireToSurface2Pdu,
+    Codec1Type, Codec2Type, Color, CreateSurfacePdu, DeleteSurfacePdu, EndFramePdu, FrameAcknowledgePdu, GfxPdu,
+    MapSurfaceToOutputPdu, PixelFormat, ResetGraphicsPdu, SolidFillPdu, StartFramePdu, Timestamp, WireToSurface1Pdu,
+    WireToSurface2Pdu,
 };
 use ironrdp_graphics::clearcodec::ClearCodecEncoder;
 use ironrdp_graphics::zgfx::wrap_uncompressed;
@@ -854,26 +855,34 @@ fn client_close_transitions_to_inactive() {
 }
 
 // ============================================================================
-// Tests: Codec Telemetry
+// Tests: Codec/Frame-Ack Telemetry
 // ============================================================================
 
 use std::sync::{Arc, Mutex};
 
-/// Handler recording `on_codec_processed` calls, used to pin the telemetry
-/// callback introduced for surface-command cost reporting.
+/// Shared, lock-guarded log of telemetry callback invocations.
+type Recorded<T> = Arc<Mutex<Vec<T>>>;
+
+/// Handler recording `on_codec_processed` and `on_frame_acknowledged` calls,
+/// used to pin the telemetry callbacks introduced for surface-command cost
+/// reporting and frame acknowledgement reporting.
 #[derive(Default)]
 struct RecordingHandler {
-    codec_processed: Arc<Mutex<Vec<CodecProcessed>>>,
+    codec_processed: Recorded<CodecProcessed>,
+    frame_acks: Recorded<FrameAcknowledgePdu>,
 }
 
 impl RecordingHandler {
-    fn new() -> (Self, Arc<Mutex<Vec<CodecProcessed>>>) {
+    fn new() -> (Self, Recorded<CodecProcessed>, Recorded<FrameAcknowledgePdu>) {
         let codec_processed = Arc::new(Mutex::new(Vec::new()));
+        let frame_acks = Arc::new(Mutex::new(Vec::new()));
         (
             Self {
                 codec_processed: Arc::clone(&codec_processed),
+                frame_acks: Arc::clone(&frame_acks),
             },
             codec_processed,
+            frame_acks,
         )
     }
 }
@@ -882,14 +891,22 @@ impl GraphicsPipelineHandler for RecordingHandler {
     fn on_codec_processed(&mut self, info: &CodecProcessed) {
         self.codec_processed.lock().unwrap().push(*info);
     }
+
+    fn on_frame_acknowledged(&mut self, ack: &FrameAcknowledgePdu) {
+        self.frame_acks.lock().unwrap().push(ack.clone());
+    }
 }
 
 fn setup_recording_client_with_surface(
     surface_id: u16,
     width: u16,
     height: u16,
-) -> (GraphicsPipelineClient, Arc<Mutex<Vec<CodecProcessed>>>) {
-    let (handler, codec_processed) = RecordingHandler::new();
+) -> (
+    GraphicsPipelineClient,
+    Recorded<CodecProcessed>,
+    Recorded<FrameAcknowledgePdu>,
+) {
+    let (handler, codec_processed, frame_acks) = RecordingHandler::new();
     let mut client = GraphicsPipelineClient::new(Box::new(handler), None);
 
     let confirm = GfxPdu::CapabilitiesConfirm(CapabilitiesConfirmPdu::from_typed(&CapabilitySet::V8 {
@@ -909,12 +926,12 @@ fn setup_recording_client_with_surface(
         .process(0, &encode_for_process(&create))
         .expect("create surface should succeed");
 
-    (client, codec_processed)
+    (client, codec_processed, frame_acks)
 }
 
 #[test]
 fn codec_processed_reports_surface_codec_payload_size() {
-    let (mut client, codec_processed) = setup_recording_client_with_surface(1, 4, 4);
+    let (mut client, codec_processed, _frame_acks) = setup_recording_client_with_surface(1, 4, 4);
 
     let bitmap_data = vec![0u8; 4 * 4 * 4];
     let expected_len = bitmap_data.len();
@@ -944,7 +961,7 @@ fn codec_processed_reports_surface_codec_payload_size() {
 
 #[test]
 fn codec_processed_fires_for_a_forwarded_avc444_pdu() {
-    let (mut client, codec_processed) = setup_recording_client_with_surface(1, 4, 4);
+    let (mut client, codec_processed, _frame_acks) = setup_recording_client_with_surface(1, 4, 4);
 
     let bitmap_data = vec![0u8; 12];
     let expected_len = bitmap_data.len();
@@ -978,7 +995,7 @@ fn codec_processed_fires_for_a_forwarded_avc444_pdu() {
 
 #[test]
 fn codec_processed_is_not_reported_when_handling_fails() {
-    let (mut client, codec_processed) = setup_recording_client_with_surface(1, 4, 4);
+    let (mut client, codec_processed, _frame_acks) = setup_recording_client_with_surface(1, 4, 4);
 
     let pdu = GfxPdu::WireToSurface1(WireToSurface1Pdu {
         surface_id: 99, // unknown surface
@@ -1004,7 +1021,7 @@ fn codec_processed_is_not_reported_when_handling_fails() {
 
 #[test]
 fn codec_processed_fires_for_a_skipped_progressive_pdu() {
-    let (mut client, codec_processed) = setup_recording_client_with_surface(1, 4, 4);
+    let (mut client, codec_processed, _frame_acks) = setup_recording_client_with_surface(1, 4, 4);
 
     // Empty bitmap_data is not a valid progressive stream: decode_bitmap fails and
     // handle_wire_to_surface2 hits the skip path, returning Ok(()).
@@ -1030,4 +1047,37 @@ fn codec_processed_fires_for_a_skipped_progressive_pdu() {
     assert_eq!(recorded[0].surface_id, 1);
     assert_eq!(recorded[0].codec, DecodedCodec::Progressive);
     assert_eq!(recorded[0].payload_bytes, expected_len);
+}
+
+#[test]
+fn frame_acknowledged_reports_the_ack_that_is_sent() {
+    let (mut client, _codec_processed, frame_acks) = setup_recording_client_with_surface(1, 4, 4);
+
+    let start = GfxPdu::StartFrame(StartFramePdu {
+        timestamp: Timestamp {
+            milliseconds: 0,
+            seconds: 0,
+            minutes: 0,
+            hours: 0,
+        },
+        frame_id: 7,
+    });
+    client.process(0, &encode_for_process(&start)).expect("start frame");
+
+    let end = GfxPdu::EndFrame(EndFramePdu { frame_id: 7 });
+    let responses = client
+        .process(0, &encode_for_process(&end))
+        .expect("end frame should succeed");
+    assert_eq!(responses.len(), 1, "should produce exactly one FrameAcknowledge");
+
+    let encoded = encode_vec(responses[0].as_ref()).expect("encode should succeed");
+    let mut cursor = ReadCursor::new(&encoded);
+    let sent_ack = match GfxPdu::decode(&mut cursor).expect("decode should succeed") {
+        GfxPdu::FrameAcknowledge(ack) => ack,
+        other => panic!("expected FrameAcknowledge, got {other:?}"),
+    };
+
+    let recorded = frame_acks.lock().unwrap();
+    assert_eq!(recorded.len(), 1, "expected exactly one on_frame_acknowledged call");
+    assert_eq!(recorded[0], sent_ack, "reported ack must match the one that is sent");
 }

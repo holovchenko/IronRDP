@@ -314,6 +314,13 @@ pub trait GraphicsPipelineHandler: Send {
     /// and this notification belong to the same logical frame.
     fn on_frame_complete(&mut self, _frame_id: u32) {}
 
+    /// Called in `handle_end_frame` with the `FrameAcknowledge` PDU about to be sent
+    ///
+    /// Per [MS-RDPEGFX 3.3.5.12].
+    ///
+    /// [MS-RDPEGFX 3.3.5.12]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpegfx/e3c80bff-3e4e-4e65-b7c2-c2cd6b1fb4f5
+    fn on_frame_acknowledged(&mut self, _ack: &FrameAcknowledgePdu) {}
+
     /// Called when the EGFX channel is closed
     fn on_close(&mut self) {}
 
@@ -1239,11 +1246,13 @@ impl GraphicsPipelineClient {
         // Per [3.3.5.12]: client MUST send FrameAcknowledge after EndFrame.
         // We send the actual queue depth (not Unavailable / 0xFFFFFFFF as FreeRDP does);
         // the real value gives the server backpressure information for frame pacing.
-        let ack = GfxPdu::FrameAcknowledge(FrameAcknowledgePdu {
+        let ack_pdu = FrameAcknowledgePdu {
             queue_depth: QueueDepth::from_u32(self.frames_queued),
             frame_id,
             total_frames_decoded: self.total_frames_decoded,
-        });
+        };
+        self.handler.on_frame_acknowledged(&ack_pdu);
+        let ack = GfxPdu::FrameAcknowledge(ack_pdu);
 
         trace!(frame_id, "Sending FrameAcknowledge");
         Ok(vec![Box::new(ack) as DvcMessage])
