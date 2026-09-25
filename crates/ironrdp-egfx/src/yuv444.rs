@@ -318,13 +318,20 @@ pub fn apply_main_view(dst: &mut Yuv444Planes, main: &Yuv420View<'_>, rect: Plan
     }
     let chroma_w = main_w.div_ceil(2);
 
-    let expanded = PlaneRect {
+    let mut expanded = PlaneRect {
         left: rect.left - rect.left % 2,
         top: rect.top - rect.top % 2,
         right: rect.right.checked_add(rect.right % 2).unwrap_or(w),
         bottom: rect.bottom.checked_add(rect.bottom % 2).unwrap_or(h),
     }
     .clip(w, h);
+    // Clipping to (w, h) can leave an odd width/height when w or h itself is
+    // odd (the even-expansion above only guarantees evenness pre-clip).
+    // Round back down to whole 2x2 blocks so every row/column written below
+    // is part of a complete block; a ragged last row or column is left
+    // untouched, matching the per-block loop this replaced.
+    expanded.right = expanded.left + expanded.width() / 2 * 2;
+    expanded.bottom = expanded.top + expanded.height() / 2 * 2;
     if expanded.is_empty() {
         return;
     }
