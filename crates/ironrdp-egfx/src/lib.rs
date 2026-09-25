@@ -9,3 +9,4 @@ pub mod compositor;
 pub mod decode;
 pub mod pdu;
 pub mod server;
+pub mod yuv444;
