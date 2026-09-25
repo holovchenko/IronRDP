@@ -70,11 +70,11 @@ use crate::CHANNEL_NAME;
 use crate::compositor::{Compositor, OutputUpdate};
 use crate::decode::{H264Decoder, H264YuvDecoder, YuvDecoderFactory};
 use crate::pdu::{
-    Avc420BitmapStream, Avc444BitmapStream, CacheImportReplyPdu, CacheToSurfacePdu, CapabilitiesAdvertisePdu,
-    CapabilitiesV8Flags, CapabilitiesV81Flags, CapabilitiesV107Flags, CapabilitySet, Codec1Type,
-    DeleteEncodingContextPdu, Encoding, EvictCacheEntryPdu, FrameAcknowledgePdu, GfxPdu, MapSurfaceToScaledOutputPdu,
-    MapSurfaceToScaledWindowPdu, MapSurfaceToWindowPdu, PixelFormat, QueueDepth, RawCapabilitySet, SolidFillPdu,
-    SurfaceToCachePdu, SurfaceToSurfacePdu, WireToSurface2Pdu,
+    Avc420BitmapStream, Avc444BitmapStream, CacheImportOfferPdu, CacheImportReplyPdu, CacheToSurfacePdu,
+    CapabilitiesAdvertisePdu, CapabilitiesV8Flags, CapabilitiesV81Flags, CapabilitiesV107Flags, CapabilitySet,
+    Codec1Type, DeleteEncodingContextPdu, Encoding, EvictCacheEntryPdu, FrameAcknowledgePdu, GfxPdu,
+    MapSurfaceToScaledOutputPdu, MapSurfaceToScaledWindowPdu, MapSurfaceToWindowPdu, PixelFormat, QueueDepth,
+    RawCapabilitySet, SolidFillPdu, SurfaceToCachePdu, SurfaceToSurfacePdu, WireToSurface2Pdu,
 };
 use crate::yuv444::{ChromaLayout, PlaneRect, Yuv444Planes, apply_aux_view, apply_main_view, convert_rect_to_rgba};
 
@@ -468,6 +468,26 @@ pub trait GraphicsPipelineHandler: Send {
     /// [MS-RDPEGFX 2.2.2.17]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpegfx/7c7a0a5d-50c1-44b9-a2e7-44b47ce1e49d
     fn on_cache_import_reply(&mut self, _pdu: &CacheImportReplyPdu) {}
 
+    /// Called after `SurfaceToCache` stored a tile in `cache_slot`, with the tile's
+    /// pixels (RGBA8888, `width * height * 4` bytes). Not called when nothing was
+    /// stored (unknown surface, empty rectangle, compositor budget refused).
+    fn on_cache_tile_stored(&mut self, _cache_key: u64, _cache_slot: u16, _width: u16, _height: u16, _rgba: &[u8]) {}
+
+    /// Tiles to offer in `CacheImportOffer`, most recently used first.
+    ///
+    /// Called at most once per client, on the first `CapabilitiesConfirm` whose set does
+    /// not carry `SMALL_CACHE`. Every tile must already be verified — see
+    /// [`CacheImportTile`].
+    fn cache_import_tiles(&mut self) -> Vec<CacheImportTile> {
+        Vec::new()
+    }
+
+    /// Called after a `CacheImportReply` was applied to the bitmap cache (after
+    /// [`Self::on_cache_import_reply`]). A non-empty
+    /// [`CacheImportOutcome::unfilled_slots`] means the server will paint from slots
+    /// this client could not fill; the handler should ask for a full refresh.
+    fn on_cache_import_outcome(&mut self, _outcome: &CacheImportOutcome) {}
+
     /// Called for PDUs that have no specific handler
     ///
     /// This is a catch-all for any GfxPdu variant not matched above.
@@ -521,6 +541,8 @@ pub struct GraphicsPipelineClient {
     state: ClientState,
     negotiated_caps: Option<CapabilitySet>,
     codec_caps: CodecCapabilities,
+    /// Whether this client already sent its one `CacheImportOffer` (or decided not to).
+    cache_import_offered: bool,
 
     surfaces: BTreeMap<u16, Surface>,
     compositor: Compositor,
@@ -569,6 +591,7 @@ impl GraphicsPipelineClient {
             state: ClientState::WaitingForConfirm,
             negotiated_caps: None,
             codec_caps: CodecCapabilities::default(),
+            cache_import_offered: false,
             surfaces: BTreeMap::new(),
             compositor: Compositor::default(),
             current_frame_id: None,
@@ -655,10 +678,7 @@ impl GraphicsPipelineClient {
 
     fn handle_pdu(&mut self, pdu: GfxPdu) -> PduResult<Vec<DvcMessage>> {
         match pdu {
-            GfxPdu::CapabilitiesConfirm(confirm) => {
-                self.handle_capabilities_confirm(confirm.0);
-                Ok(vec![])
-            }
+            GfxPdu::CapabilitiesConfirm(confirm) => Ok(self.handle_capabilities_confirm(confirm.0)),
             GfxPdu::ResetGraphics(reset) => {
                 self.handle_reset_graphics(reset.width, reset.height);
                 Ok(vec![])
@@ -762,6 +782,12 @@ impl GraphicsPipelineClient {
                 );
                 self.compositor
                     .surface_to_cache(pdu.surface_id, pdu.cache_slot, &pdu.source_rectangle);
+                if let Some((width, height, rgba)) = self.compositor.cache_tile(pdu.cache_slot) {
+                    if width > 0 && height > 0 {
+                        self.handler
+                            .on_cache_tile_stored(pdu.cache_key, pdu.cache_slot, width, height, rgba);
+                    }
+                }
                 self.handler.on_surface_to_cache(&pdu);
                 Ok(vec![])
             }
@@ -784,8 +810,20 @@ impl GraphicsPipelineClient {
                 Ok(vec![])
             }
             GfxPdu::CacheImportReply(pdu) => {
-                trace!("CacheImportReply");
+                let outcome = self.compositor.commit_import(&pdu.cache_slots);
+                debug!(
+                    offered = outcome.offered,
+                    imported = outcome.imported.len(),
+                    "CacheImportReply"
+                );
+                if !outcome.unfilled_slots.is_empty() {
+                    warn!(
+                        unfilled = ?outcome.unfilled_slots,
+                        "CacheImportReply names cache slots this client holds no tile for"
+                    );
+                }
                 self.handler.on_cache_import_reply(&pdu);
+                self.handler.on_cache_import_outcome(&outcome);
                 Ok(vec![])
             }
 
@@ -832,7 +870,7 @@ impl GraphicsPipelineClient {
         }
     }
 
-    fn handle_capabilities_confirm(&mut self, cap: RawCapabilitySet) {
+    fn handle_capabilities_confirm(&mut self, cap: RawCapabilitySet) -> Vec<DvcMessage> {
         // Server confirms a single capability set. If we cannot interpret it
         // (unknown version, or malformed body), we still transition to Active
         // to avoid hanging the session, but we keep `negotiated_caps` empty
@@ -846,12 +884,12 @@ impl GraphicsPipelineClient {
                     "Server confirmed an unknown EGFX capability version; proceeding with defaults"
                 );
                 self.state = ClientState::Active;
-                return;
+                return Vec::new();
             }
             Err(e) => {
                 warn!(error = %e, "Failed to parse server's EGFX capabilities confirmation");
                 self.state = ClientState::Active;
-                return;
+                return Vec::new();
             }
         };
 
@@ -866,6 +904,27 @@ impl GraphicsPipelineClient {
         );
 
         self.handler.on_capabilities_confirmed(cap);
+
+        self.cache_import_offer()
+    }
+
+    /// Build the one `CacheImportOffer` this client sends, right after the first
+    /// `CapabilitiesConfirm` (FreeRDP sends it at the same point). Skipped under
+    /// `SMALL_CACHE`: the server's 16 MB cache model has no room for a 100 MB import.
+    #[expect(clippy::as_conversions, reason = "Box<GfxPdu> to Box<dyn DvcEncode> coercion")]
+    fn cache_import_offer(&mut self) -> Vec<DvcMessage> {
+        if self.cache_import_offered || self.codec_caps.small_cache {
+            return Vec::new();
+        }
+        self.cache_import_offered = true;
+        let tiles = self.handler.cache_import_tiles();
+        let cache_entries = self.compositor.stage_import(tiles);
+        if cache_entries.is_empty() {
+            return Vec::new();
+        }
+        debug!(entries = cache_entries.len(), "Sending CacheImportOffer");
+        let pdu = GfxPdu::CacheImportOffer(CacheImportOfferPdu { cache_entries });
+        vec![Box::new(pdu) as DvcMessage]
     }
 
     fn handle_reset_graphics(&mut self, width: u32, height: u32) {
@@ -1650,6 +1709,7 @@ impl DvcProcessor for GraphicsPipelineClient {
 
     fn close(&mut self, _channel_id: u32) {
         self.state = ClientState::Closed;
+        self.compositor.discard_import();
         self.handler.on_close();
     }
 
