@@ -1,14 +1,15 @@
 use ironrdp_core::{Decode as _, Encode, ReadCursor, WriteCursor, encode_vec};
 use ironrdp_dvc::DvcProcessor as _;
 use ironrdp_egfx::client::{
-    BitmapUpdate, CodecProcessed, DecodedCodec, GraphicsPipelineClient, GraphicsPipelineHandler, Surface,
+    BitmapUpdate, CacheImportOutcome, CacheImportTile, CodecProcessed, DecodedCodec, GraphicsPipelineClient,
+    GraphicsPipelineHandler, Surface,
 };
 use ironrdp_egfx::decode::{DecodedFrame, DecoderResult, H264Decoder};
 use ironrdp_egfx::pdu::{
-    CapabilitiesAdvertisePdu, CapabilitiesConfirmPdu, CapabilitiesV8Flags, CapabilitySet, CapabilityVersion,
-    Codec1Type, Codec2Type, Color, CreateSurfacePdu, DeleteSurfacePdu, EndFramePdu, FrameAcknowledgePdu, GfxPdu,
-    MapSurfaceToOutputPdu, PixelFormat, ResetGraphicsPdu, SolidFillPdu, StartFramePdu, Timestamp, WireToSurface1Pdu,
-    WireToSurface2Pdu,
+    CacheImportReplyPdu, CacheToSurfacePdu, CapabilitiesAdvertisePdu, CapabilitiesConfirmPdu, CapabilitiesV8Flags,
+    CapabilitySet, CapabilityVersion, Codec1Type, Codec2Type, Color, CreateSurfacePdu, DeleteSurfacePdu, EndFramePdu,
+    FrameAcknowledgePdu, GfxPdu, MapSurfaceToOutputPdu, PixelFormat, Point, ResetGraphicsPdu, SolidFillPdu,
+    StartFramePdu, SurfaceToCachePdu, Timestamp, WireToSurface1Pdu, WireToSurface2Pdu,
 };
 use ironrdp_graphics::clearcodec::ClearCodecEncoder;
 use ironrdp_graphics::zgfx::wrap_uncompressed;
@@ -1080,4 +1081,353 @@ fn frame_acknowledged_reports_the_ack_that_is_sent() {
     let recorded = frame_acks.lock().unwrap();
     assert_eq!(recorded.len(), 1, "expected exactly one on_frame_acknowledged call");
     assert_eq!(recorded[0], sent_ack, "reported ack must match the one that is sent");
+}
+
+// ============================================================================
+// Tests: Persistent cache import (Tessera)
+// ============================================================================
+
+#[derive(Default)]
+struct CacheLog {
+    import_calls: u32,
+    stored: Vec<(u64, u16, u16, u16, Vec<u8>)>,
+    outcomes: Vec<CacheImportOutcome>,
+}
+
+struct CacheHandler {
+    tiles: Vec<CacheImportTile>,
+    log: Arc<Mutex<CacheLog>>,
+}
+
+impl GraphicsPipelineHandler for CacheHandler {
+    fn on_cache_tile_stored(&mut self, cache_key: u64, cache_slot: u16, width: u16, height: u16, rgba: &[u8]) {
+        self.log
+            .lock()
+            .unwrap()
+            .stored
+            .push((cache_key, cache_slot, width, height, rgba.to_vec()));
+    }
+    fn cache_import_tiles(&mut self) -> Vec<CacheImportTile> {
+        self.log.lock().unwrap().import_calls += 1;
+        core::mem::take(&mut self.tiles)
+    }
+    fn on_cache_import_outcome(&mut self, outcome: &CacheImportOutcome) {
+        self.log.lock().unwrap().outcomes.push(outcome.clone());
+    }
+}
+
+fn solid_tile(cache_key: u64, width: u16, height: u16, fill: u8) -> CacheImportTile {
+    CacheImportTile {
+        cache_key,
+        width,
+        height,
+        data: vec![fill; usize::from(width) * usize::from(height) * 4],
+    }
+}
+
+fn cache_client(tiles: Vec<CacheImportTile>) -> (GraphicsPipelineClient, Arc<Mutex<CacheLog>>) {
+    let log = Arc::new(Mutex::new(CacheLog::default()));
+    let handler = CacheHandler {
+        tiles,
+        log: Arc::clone(&log),
+    };
+    (GraphicsPipelineClient::new(Box::new(handler), None), log)
+}
+
+fn confirm_v8(flags: CapabilitiesV8Flags) -> Vec<u8> {
+    encode_for_process(&GfxPdu::CapabilitiesConfirm(CapabilitiesConfirmPdu::from_typed(
+        &CapabilitySet::V8 { flags },
+    )))
+}
+
+fn decode_gfx(msg: &ironrdp_dvc::DvcMessage) -> GfxPdu {
+    let encoded = encode_vec(msg.as_ref()).expect("encode");
+    GfxPdu::decode(&mut ReadCursor::new(&encoded)).expect("decode")
+}
+
+fn frame(id: u32, pdus: Vec<GfxPdu>) -> Vec<GfxPdu> {
+    let ts = Timestamp {
+        milliseconds: 0,
+        seconds: 0,
+        minutes: 0,
+        hours: 0,
+    };
+    let mut all = vec![GfxPdu::StartFrame(StartFramePdu {
+        timestamp: ts,
+        frame_id: id,
+    })];
+    all.extend(pdus);
+    all.push(GfxPdu::EndFrame(EndFramePdu { frame_id: id }));
+    all
+}
+
+fn process_all(client: &mut GraphicsPipelineClient, pdus: Vec<GfxPdu>) {
+    for pdu in pdus {
+        client.process(0, &encode_for_process(&pdu)).expect("process");
+    }
+}
+
+/// Paint drained updates, in order, into a `width x height` RGBA canvas. Checking the
+/// canvas instead of individual updates keeps the tests independent of how the
+/// compositor splits or merges dirty regions.
+fn compose(updates: &[ironrdp_egfx::compositor::OutputUpdate], width: usize, height: usize) -> Vec<u8> {
+    let mut canvas = vec![0u8; width * height * 4];
+    for u in updates {
+        let (l, t) = (usize::from(u.region.left), usize::from(u.region.top));
+        let w = usize::from(u.region.right - u.region.left);
+        for row in 0..usize::from(u.region.bottom - u.region.top) {
+            let dst = ((t + row) * width + l) * 4;
+            canvas[dst..dst + w * 4].copy_from_slice(&u.data[row * w * 4..(row + 1) * w * 4]);
+        }
+    }
+    canvas
+}
+
+/// The `w x h` block at `(x, y)` of a canvas `width` pixels wide, row-major RGBA.
+fn block(canvas: &[u8], width: usize, x: usize, y: usize, w: usize, h: usize) -> Vec<u8> {
+    (0..h)
+        .flat_map(|r| canvas[((y + r) * width + x) * 4..((y + r) * width + x + w) * 4].to_vec())
+        .collect()
+}
+
+#[test]
+fn client_offers_cache_import_after_caps_confirm() {
+    let (mut client, log) = cache_client(vec![solid_tile(0xAA, 2, 2, 1), solid_tile(0xBB, 4, 1, 2)]);
+    let out = client
+        .process(0, &confirm_v8(CapabilitiesV8Flags::empty()))
+        .expect("confirm");
+    assert_eq!(out.len(), 1, "the offer is the one response to the confirm");
+    let GfxPdu::CacheImportOffer(offer) = decode_gfx(&out[0]) else {
+        panic!("expected CacheImportOffer")
+    };
+    let entries: Vec<(u64, u32)> = offer
+        .cache_entries
+        .iter()
+        .map(|e| (e.cache_key, e.bitmap_len))
+        .collect();
+    assert_eq!(entries, vec![(0xAA, 16), (0xBB, 16)]);
+    assert_eq!(log.lock().unwrap().import_calls, 1);
+}
+
+#[test]
+fn client_does_not_offer_under_small_cache() {
+    let (mut client, log) = cache_client(vec![solid_tile(0xAA, 2, 2, 1)]);
+    let out = client
+        .process(0, &confirm_v8(CapabilitiesV8Flags::SMALL_CACHE))
+        .expect("confirm");
+    assert!(out.is_empty());
+    assert_eq!(log.lock().unwrap().import_calls, 0, "tiles must not even be requested");
+}
+
+#[test]
+fn client_offers_at_most_once() {
+    let (mut client, log) = cache_client(vec![solid_tile(0xAA, 2, 2, 1)]);
+    assert_eq!(
+        client
+            .process(0, &confirm_v8(CapabilitiesV8Flags::empty()))
+            .expect("confirm")
+            .len(),
+        1
+    );
+    assert!(
+        client
+            .process(0, &confirm_v8(CapabilitiesV8Flags::empty()))
+            .expect("confirm 2")
+            .is_empty()
+    );
+    assert_eq!(log.lock().unwrap().import_calls, 1);
+}
+
+#[test]
+fn client_sends_no_offer_without_tiles() {
+    let (mut client, _log) = cache_client(Vec::new());
+    assert!(
+        client
+            .process(0, &confirm_v8(CapabilitiesV8Flags::empty()))
+            .expect("confirm")
+            .is_empty()
+    );
+}
+
+/// The invariant this feature must never break: every slot the reply names paints
+/// the offered tile at the same index, and the outcome lists exactly those slots.
+#[test]
+fn client_fills_exactly_the_accepted_slots() {
+    let (mut client, log) = cache_client(vec![
+        solid_tile(1, 2, 2, 0x11),
+        solid_tile(2, 2, 2, 0x22),
+        solid_tile(3, 2, 2, 0x33),
+    ]);
+    client
+        .process(0, &confirm_v8(CapabilitiesV8Flags::empty()))
+        .expect("confirm");
+    process_all(
+        &mut client,
+        vec![
+            GfxPdu::CacheImportReply(CacheImportReplyPdu {
+                cache_slots: vec![5, 0, 9],
+            }),
+            GfxPdu::ResetGraphics(ResetGraphicsPdu {
+                width: 16,
+                height: 16,
+                monitors: vec![],
+            }),
+            GfxPdu::CreateSurface(CreateSurfacePdu {
+                surface_id: 1,
+                width: 16,
+                height: 16,
+                pixel_format: PixelFormat::XRgb,
+            }),
+            GfxPdu::MapSurfaceToOutput(MapSurfaceToOutputPdu {
+                surface_id: 1,
+                output_origin_x: 0,
+                output_origin_y: 0,
+            }),
+        ],
+    );
+    let _ = client.drain_output();
+    process_all(
+        &mut client,
+        frame(
+            1,
+            vec![
+                GfxPdu::CacheToSurface(CacheToSurfacePdu {
+                    cache_slot: 5,
+                    surface_id: 1,
+                    destination_points: vec![Point { x: 0, y: 0 }],
+                }),
+                GfxPdu::CacheToSurface(CacheToSurfacePdu {
+                    cache_slot: 9,
+                    surface_id: 1,
+                    destination_points: vec![Point { x: 8, y: 8 }],
+                }),
+            ],
+        ),
+    );
+    let canvas = compose(&client.drain_output(), 16, 16);
+    assert_eq!(
+        block(&canvas, 16, 0, 0, 2, 2),
+        vec![0x11; 16],
+        "slot 5 must hold offer entry 0"
+    );
+    assert_eq!(
+        block(&canvas, 16, 8, 8, 2, 2),
+        vec![0x33; 16],
+        "slot 9 must hold offer entry 2"
+    );
+    let log = log.lock().unwrap();
+    assert_eq!(log.outcomes.len(), 1);
+    assert_eq!(log.outcomes[0].imported, vec![(1, 5), (3, 9)]);
+    assert!(log.outcomes[0].unfilled_slots.is_empty());
+}
+
+#[test]
+fn client_reports_reply_slots_it_cannot_fill() {
+    let (mut client, log) = cache_client(vec![solid_tile(1, 1, 1, 0x11)]);
+    client
+        .process(0, &confirm_v8(CapabilitiesV8Flags::empty()))
+        .expect("confirm");
+    process_all(
+        &mut client,
+        vec![GfxPdu::CacheImportReply(CacheImportReplyPdu {
+            cache_slots: vec![4, 6, 8],
+        })],
+    );
+    let log = log.lock().unwrap();
+    assert_eq!(log.outcomes[0].imported, vec![(1, 4)]);
+    assert_eq!(log.outcomes[0].unfilled_slots, vec![6, 8]);
+}
+
+#[test]
+fn client_hands_stored_tiles_to_the_handler() {
+    let (mut client, log) = cache_client(Vec::new());
+    client
+        .process(0, &confirm_v8(CapabilitiesV8Flags::empty()))
+        .expect("confirm");
+    process_all(
+        &mut client,
+        vec![GfxPdu::CreateSurface(CreateSurfacePdu {
+            surface_id: 1,
+            width: 8,
+            height: 8,
+            pixel_format: PixelFormat::XRgb,
+        })],
+    );
+    process_all(
+        &mut client,
+        frame(
+            1,
+            vec![
+                GfxPdu::SolidFill(SolidFillPdu {
+                    surface_id: 1,
+                    fill_pixel: Color {
+                        b: 0x30,
+                        g: 0x20,
+                        r: 0x10,
+                        xa: 0,
+                    },
+                    rectangles: vec![ExclusiveRectangle {
+                        left: 0,
+                        top: 0,
+                        right: 2,
+                        bottom: 1,
+                    }],
+                }),
+                GfxPdu::SurfaceToCache(SurfaceToCachePdu {
+                    surface_id: 1,
+                    cache_key: 0xDEAD_BEEF,
+                    cache_slot: 3,
+                    source_rectangle: ExclusiveRectangle {
+                        left: 0,
+                        top: 0,
+                        right: 2,
+                        bottom: 1,
+                    },
+                }),
+                // A tile from a surface that does not exist is not stored, so it is not handed over.
+                GfxPdu::SurfaceToCache(SurfaceToCachePdu {
+                    surface_id: 42,
+                    cache_key: 0xFEED,
+                    cache_slot: 4,
+                    source_rectangle: ExclusiveRectangle {
+                        left: 0,
+                        top: 0,
+                        right: 2,
+                        bottom: 1,
+                    },
+                }),
+            ],
+        ),
+    );
+    let log = log.lock().unwrap();
+    assert_eq!(
+        log.stored,
+        vec![(
+            0xDEAD_BEEF,
+            3,
+            2,
+            1,
+            vec![0x10, 0x20, 0x30, 0xFF, 0x10, 0x20, 0x30, 0xFF]
+        )]
+    );
+}
+
+#[test]
+fn client_close_releases_staged_import() {
+    let (mut client, log) = cache_client(vec![solid_tile(1, 1, 1, 0x11)]);
+    client
+        .process(0, &confirm_v8(CapabilitiesV8Flags::empty()))
+        .expect("confirm");
+    client.close(0);
+    // Nothing staged survives the close: a late reply fills nothing and reports the slot.
+    client
+        .process(
+            0,
+            &encode_for_process(&GfxPdu::CacheImportReply(CacheImportReplyPdu { cache_slots: vec![4] })),
+        )
+        .expect("process after close");
+    let log = log.lock().unwrap();
+    assert_eq!(log.outcomes.len(), 1);
+    assert!(log.outcomes[0].imported.is_empty());
+    assert_eq!(log.outcomes[0].unfilled_slots, vec![4]);
 }
