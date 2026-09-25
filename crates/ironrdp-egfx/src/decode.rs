@@ -178,6 +178,112 @@ pub trait H264Decoder: Send {
 }
 
 // ============================================================================
+// Planar YUV Output
+// ============================================================================
+
+/// A borrowed planar 4:2:0 picture (I420) as a decoder hands it back.
+///
+/// `y` holds `height` rows of `y_stride` bytes (at least `width` used per row);
+/// `u` and `v` each hold `height.div_ceil(2)` rows of `chroma_stride` bytes
+/// (at least `width.div_ceil(2)` used per row). The view is valid until the
+/// decoder's next `decode_yuv` call.
+#[derive(Clone, Copy)]
+pub struct Yuv420View<'a> {
+    pub width: u32,
+    pub height: u32,
+    pub y: &'a [u8],
+    pub y_stride: usize,
+    pub u: &'a [u8],
+    pub v: &'a [u8],
+    pub chroma_stride: usize,
+}
+
+impl Yuv420View<'_> {
+    /// Number of chroma columns: `width.div_ceil(2)`.
+    fn chroma_width(&self) -> usize {
+        // `u32::div_ceil` result always fits in `usize` on all supported platforms.
+        usize::try_from(self.width.div_ceil(2)).unwrap_or(usize::MAX)
+    }
+
+    /// Number of chroma rows: `height.div_ceil(2)`.
+    fn chroma_height(&self) -> usize {
+        usize::try_from(self.height.div_ceil(2)).unwrap_or(usize::MAX)
+    }
+
+    /// `true` when every plane is long enough for the declared geometry and
+    /// every stride is at least the plane's used width. Never panics and never
+    /// overflows: geometry that does not fit in `usize` is simply not well formed.
+    pub fn is_well_formed(&self) -> bool {
+        if self.width == 0 || self.height == 0 {
+            return false;
+        }
+
+        let Ok(width) = usize::try_from(self.width) else {
+            return false;
+        };
+        let Ok(height) = usize::try_from(self.height) else {
+            return false;
+        };
+        let chroma_width = self.chroma_width();
+        let chroma_height = self.chroma_height();
+
+        Self::plane_is_well_formed(self.y.len(), self.y_stride, width, height)
+            && Self::plane_is_well_formed(self.u.len(), self.chroma_stride, chroma_width, chroma_height)
+            && Self::plane_is_well_formed(self.v.len(), self.chroma_stride, chroma_width, chroma_height)
+    }
+
+    /// Required length is `(rows - 1) * stride + used_width` (the last row need
+    /// not be padded to the stride); `stride` must be at least `used_width`.
+    fn plane_is_well_formed(plane_len: usize, stride: usize, used_width: usize, rows: usize) -> bool {
+        if stride < used_width {
+            return false;
+        }
+
+        let Some(rows_minus_one) = rows.checked_sub(1) else {
+            return false;
+        };
+        let Some(leading_rows_len) = rows_minus_one.checked_mul(stride) else {
+            return false;
+        };
+        let Some(required_len) = leading_rows_len.checked_add(used_width) else {
+            return false;
+        };
+
+        plane_len >= required_len
+    }
+}
+
+impl fmt::Debug for Yuv420View<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Yuv420View")
+            .field("width", &self.width)
+            .field("height", &self.height)
+            .field("y_len", &self.y.len())
+            .field("y_stride", &self.y_stride)
+            .field("u_len", &self.u.len())
+            .field("v_len", &self.v.len())
+            .field("chroma_stride", &self.chroma_stride)
+            .finish()
+    }
+}
+
+/// Decoder that returns planar YUV instead of RGBA — used for the two AVC444 streams.
+pub trait H264YuvDecoder: Send {
+    /// Decode AVC-format H.264 NAL units (4-byte BE length prefix, not Annex B)
+    /// into a borrowed planar 4:2:0 picture. Frame dimensions may exceed the
+    /// surface because of macroblock alignment; the caller clips.
+    fn decode_yuv(&mut self, data: &[u8]) -> DecoderResult<Yuv420View<'_>>;
+
+    /// Reset decoder state (ResetGraphics / resync after a failure); default no-op.
+    fn reset(&mut self) {
+        // Default: no-op
+    }
+}
+
+/// Factory the client uses to create the main and auxiliary decoder of one surface.
+pub type YuvDecoderFactory = Box<dyn Fn() -> Option<Box<dyn H264YuvDecoder>> + Send>;
+
+// ============================================================================
 // OpenH264 Implementation
 // ============================================================================
 
@@ -288,3 +394,123 @@ mod openh264_impl {
 
 #[cfg(feature = "openh264")]
 pub use openh264_impl::OpenH264Decoder;
+
+#[cfg(test)]
+mod tests {
+    use super::Yuv420View;
+
+    #[test]
+    fn well_formed_accepts_an_exact_i420_buffer() {
+        let y = [0u8; 24]; // 6x4, stride 6
+        let u = [0u8; 6]; // 3x2, stride 3
+        let v = [0u8; 6];
+        let view = Yuv420View {
+            width: 6,
+            height: 4,
+            y: &y,
+            y_stride: 6,
+            u: &u,
+            v: &v,
+            chroma_stride: 3,
+        };
+        assert!(view.is_well_formed());
+    }
+
+    #[test]
+    fn well_formed_accepts_an_unpadded_last_row() {
+        // width 6, height 4, y_stride 10: buffer sized (rows-1)*stride + width.
+        let y = vec![0u8; 3 * 10 + 6];
+        let u = vec![0u8; 5 + 3];
+        let v = vec![0u8; 5 + 3];
+        let view = Yuv420View {
+            width: 6,
+            height: 4,
+            y: &y,
+            y_stride: 10,
+            u: &u,
+            v: &v,
+            chroma_stride: 5,
+        };
+        assert!(view.is_well_formed());
+    }
+
+    #[test]
+    fn well_formed_rejects_a_short_chroma_plane() {
+        let y = [0u8; 24];
+        let u = [0u8; 5]; // one byte short of the required 6.
+        let v = [0u8; 6];
+        let view = Yuv420View {
+            width: 6,
+            height: 4,
+            y: &y,
+            y_stride: 6,
+            u: &u,
+            v: &v,
+            chroma_stride: 3,
+        };
+        assert!(!view.is_well_formed());
+    }
+
+    #[test]
+    fn well_formed_rejects_a_stride_below_the_width() {
+        let y = [0u8; 24];
+        let u = [0u8; 6];
+        let v = [0u8; 6];
+        let view = Yuv420View {
+            width: 6,
+            height: 4,
+            y: &y,
+            y_stride: 5, // less than width 6.
+            u: &u,
+            v: &v,
+            chroma_stride: 3,
+        };
+        assert!(!view.is_well_formed());
+    }
+
+    #[test]
+    fn well_formed_rejects_zero_dimensions() {
+        let y = [0u8; 24];
+        let u = [0u8; 6];
+        let v = [0u8; 6];
+
+        let zero_width = Yuv420View {
+            width: 0,
+            height: 4,
+            y: &y,
+            y_stride: 6,
+            u: &u,
+            v: &v,
+            chroma_stride: 3,
+        };
+        assert!(!zero_width.is_well_formed());
+
+        let zero_height = Yuv420View {
+            width: 6,
+            height: 0,
+            y: &y,
+            y_stride: 6,
+            u: &u,
+            v: &v,
+            chroma_stride: 3,
+        };
+        assert!(!zero_height.is_well_formed());
+    }
+
+    #[test]
+    fn well_formed_rejects_u32_max_geometry_without_panicking() {
+        let y = [0u8; 4];
+        let u = [0u8; 4];
+        let v = [0u8; 4];
+        let view = Yuv420View {
+            width: u32::MAX,
+            height: u32::MAX,
+            y: &y,
+            y_stride: usize::MAX,
+            u: &u,
+            v: &v,
+            chroma_stride: usize::MAX,
+        };
+        assert!(!view.is_well_formed());
+    }
+}
