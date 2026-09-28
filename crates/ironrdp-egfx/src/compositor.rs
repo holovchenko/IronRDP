@@ -157,6 +157,12 @@ pub(crate) struct Compositor {
 }
 
 impl Compositor {
+    /// Current output buffer size, as last set by `ResetGraphics`.
+    /// TESSERA PATCH: used by the graphics replay tool.
+    pub(crate) fn output_size(&self) -> (u16, u16) {
+        (self.output_width, self.output_height)
+    }
+
     /// Handle `ResetGraphics`: resize the graphics output and discard pending output.
     ///
     /// Per MS-RDPEGFX 3.3.5.14, the only client requirement on receiving

@@ -513,6 +513,10 @@ enum ClientState {
 // Graphics Pipeline Client
 // ============================================================================
 
+/// Observer of every raw DVC payload, called before ZGFX decompression.
+/// TESSERA PATCH: used by the worker's graphics recorder (gfx_record).
+pub type PayloadTap = Box<dyn FnMut(&[u8]) + Send>;
+
 /// Client for the Graphics Pipeline Virtual Channel (EGFX)
 ///
 /// This client handles capability negotiation, surface tracking,
@@ -568,6 +572,9 @@ pub struct GraphicsPipelineClient {
     /// stream info, missing/failed decoder, or chroma before any luma). Same
     /// warn-once/debug-after pattern as `skipped_wire_to_surface2`.
     skipped_avc444: u32,
+    /// Observer of every raw DVC payload, installed via [`Self::set_payload_tap`].
+    /// TESSERA PATCH: used by the worker's graphics recorder (gfx_record).
+    payload_tap: Option<PayloadTap>,
 }
 
 impl GraphicsPipelineClient {
@@ -600,7 +607,21 @@ impl GraphicsPipelineClient {
             pending_reset: None,
             skipped_wire_to_surface2: 0,
             skipped_avc444: 0,
+            payload_tap: None,
         }
+    }
+
+    /// Install a tap that sees each server→client payload byte-for-byte, before
+    /// decompression. Replaces any previous tap.
+    /// TESSERA PATCH: used by the worker's graphics recorder (gfx_record).
+    pub fn set_payload_tap(&mut self, tap: PayloadTap) {
+        self.payload_tap = Some(tap);
+    }
+
+    /// Current output buffer size, as last set by `ResetGraphics`.
+    /// TESSERA PATCH: used by the graphics replay tool.
+    pub fn output_size(&self) -> (u16, u16) {
+        self.compositor.output_size()
     }
 
     /// Attach the factory used to create the two `H264YuvDecoder` instances
@@ -1714,6 +1735,10 @@ impl DvcProcessor for GraphicsPipelineClient {
     }
 
     fn process(&mut self, _channel_id: u32, payload: &[u8]) -> PduResult<Vec<DvcMessage>> {
+        if let Some(tap) = self.payload_tap.as_mut() {
+            tap(payload);
+        }
+
         // ZGFX decompress
         self.decompressed_buffer.clear();
         self.decompressed_buffer.shrink_to(MAX_DECOMPRESSED_BUFFER_CAPACITY);
@@ -3065,5 +3090,28 @@ mod tests {
 
         assert!(client.is_active());
         assert_eq!(client.skipped_wire_to_surface2, 2);
+    }
+
+    #[test]
+    fn payload_tap_sees_raw_bytes_before_decompression() {
+        let seen: Arc<Mutex<Vec<Vec<u8>>>> = Arc::default();
+        let sink = Arc::clone(&seen);
+        let mut client = GraphicsPipelineClient::new(Box::new(TestHandler), None);
+        client.set_payload_tap(Box::new(move |bytes| sink.lock().unwrap().push(bytes.to_vec())));
+        // ZGFX single segment, RDP8 type, not compressed, empty body.
+        let payload = [0xE0u8, 0x04];
+        let _ = client.process(0, &payload);
+        assert_eq!(*seen.lock().unwrap(), vec![payload.to_vec()]);
+    }
+
+    #[test]
+    fn output_size_follows_reset_graphics() {
+        let mut client = GraphicsPipelineClient::new(Box::new(TestHandler), None);
+        let _ = client.handle_pdu(GfxPdu::ResetGraphics(crate::pdu::ResetGraphicsPdu {
+            width: 320,
+            height: 200,
+            monitors: vec![],
+        }));
+        assert_eq!(client.output_size(), (320, 200));
     }
 }
