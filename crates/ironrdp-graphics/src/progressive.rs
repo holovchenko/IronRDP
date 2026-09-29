@@ -1554,10 +1554,7 @@ impl ProgressiveDecoder {
             // REGION rectangles may be covered by tiles sent in an earlier REGION
             // within the same frame, so clip them against every tile currently
             // available for this frame rather than only the newly decoded tiles.
-            // Tiles present only for clip coverage are reconstructed after the loop, in parallel
-            // when enabled; nothing mutates `context.surface` during the loop, so deferred
-            // reconstruction from it afterward yields the same pixels as reconstructing inline.
-            // `decoded_tiles` keeps its order either way.
+            // Clip-coverage-only tiles are filled after the loop by `reconstruct_repaints`.
             let mut repaint: Vec<usize> = Vec::new();
             for &(x_idx, y_idx) in frame_tiles.iter() {
                 charge_region_clipping_work(&mut region_clipping_work, clipping_region.rectangles.len().max(1))?;
