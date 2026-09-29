@@ -3469,6 +3469,16 @@ mod tests {
     }
 
     /// Everything a later payload can observe: retained references and which grid slots exist.
+    fn hash_component_codec_quant(hash: &mut u64, quant: &ComponentCodecQuant) {
+        fnv(
+            hash,
+            &[
+                quant.ll3, quant.hl3, quant.lh3, quant.hh3, quant.hl2, quant.lh2, quant.hh2, quant.hl1, quant.lh1,
+                quant.hh1,
+            ],
+        );
+    }
+
     fn hash_decoder_state(hash: &mut u64, decoder: &ProgressiveDecoder) {
         for (key, reference) in &decoder.references {
             fnv(hash, &key.0.to_le_bytes());
@@ -3484,8 +3494,35 @@ mod tests {
             for slot in &context.surface.tiles {
                 fnv(hash, &[u8::from(slot.is_some())]);
                 if let Some(state) = slot {
+                    // Every TileState field: two tiles that differ only in sign, prog_quant,
+                    // quant_idx, base_quant, or the slot's own coefficients (not just pass /
+                    // quality / is_difference) must hash differently.
+                    for component in &state.coefficients {
+                        for c in component {
+                            fnv(hash, &c.to_le_bytes());
+                        }
+                    }
+                    for component in &state.sign {
+                        for s in component {
+                            fnv(hash, &s.to_le_bytes());
+                        }
+                    }
+                    for prog_quant in &state.prog_quant {
+                        hash_component_codec_quant(hash, prog_quant);
+                    }
+                    fnv(hash, &state.quant_idx);
+                    for base_quant in &state.base_quant {
+                        hash_component_codec_quant(hash, base_quant);
+                    }
                     fnv(hash, &state.pass.to_le_bytes());
-                    fnv(hash, &[state.quality, u8::from(state.is_difference)]);
+                    fnv(
+                        hash,
+                        &[
+                            state.quality,
+                            u8::from(state.is_difference),
+                            u8::from(state.use_reduce_extrapolate),
+                        ],
+                    );
                 }
             }
         }
@@ -3646,6 +3683,25 @@ mod tests {
         y_idx: u16,
         raw: &'a [u8],
     ) -> ironrdp_pdu::codecs::rfx::progressive::ProgressiveTile<'a> {
+        upgrade_tile_with_srl(x_idx, y_idx, &[], raw)
+    }
+
+    /// Like [`upgrade_tile`] but with non-empty SRL data, so a fixture can exercise
+    /// [`decode_upgrade_pass`]'s SRL path (zero-DAS positions that transition to non-zero,
+    /// captured in `TileState::sign`) instead of only its raw-magnitude path.
+    ///
+    /// The fixture's progressive quant tables only change bit position between the first pass
+    /// and this upgrade for the HL1 band (`hl1: 2` -> `hl1: 0`, `num_bits = 2`), so `srl` must be
+    /// encoded with `num_bits = 2` (`ironrdp_graphics::srl::encode_srl(values, 2)`, magnitudes
+    /// 1..=3). HL1 (offset 0, 1024 coefficients) is essentially all zero-DAS after the first
+    /// pass for these fixture tiles, so a handful of leading non-zero values are guaranteed to
+    /// land on zero-DAS positions and flip their sign, regardless of the exact zero count.
+    fn upgrade_tile_with_srl<'a>(
+        x_idx: u16,
+        y_idx: u16,
+        srl: &'a [u8],
+        raw: &'a [u8],
+    ) -> ironrdp_pdu::codecs::rfx::progressive::ProgressiveTile<'a> {
         ironrdp_pdu::codecs::rfx::progressive::ProgressiveTile::Upgrade(
             ironrdp_pdu::codecs::rfx::progressive::TileUpgrade {
                 quant_idx_y: 0,
@@ -3654,19 +3710,20 @@ mod tests {
                 x_idx,
                 y_idx,
                 quality: 1,
-                y_srl_data: &[],
+                y_srl_data: srl,
                 y_raw_data: raw,
-                cb_srl_data: &[],
+                cb_srl_data: srl,
                 cb_raw_data: raw,
-                cr_srl_data: &[],
+                cr_srl_data: srl,
                 cr_raw_data: raw,
             },
         )
     }
 
-    /// Three payloads in one RDPGFX frame: 32 first-pass tiles; 18 upgrades + difference
-    /// tiles (one upgrade on a tile with no first pass); one simple tile whose REGION rect also
-    /// covers tiles from earlier payloads (clip-coverage repaint).
+    /// Three payloads in one RDPGFX frame: 32 first-pass tiles; 18 upgrades (two of them with
+    /// real SRL data, exercising the SRL zero-DAS-transition path) + difference tiles (one
+    /// upgrade on a tile with no first pass); one simple tile whose REGION rect also covers
+    /// tiles from earlier payloads (clip-coverage repaint).
     fn characterization_hash(decoder: &mut ProgressiveDecoder) -> u64 {
         let mut hash = 0xcbf2_9ce4_8422_2325u64;
         decoder.begin_frame();
@@ -3694,12 +3751,20 @@ mod tests {
         hash_tiles(&mut hash, &tiles_out);
 
         let raw = [0xA5u8; 8];
+        // Non-empty SRL data for two upgrades, so the SRL zero-DAS-transition path (and its
+        // resulting sign-state changes) runs, not only the raw-magnitude path.
+        let srl_a = srl::encode_srl(&[1i16, -2, 3], 2).expect("fixture SRL encode");
+        let srl_b = srl::encode_srl(&[-1i16, 3, -3, 2], 2).expect("fixture SRL encode");
         let diff_a = fixture_component(0, 0, 5);
         let diff_b = fixture_component(6, 3, -4);
         let mut tiles: Vec<_> = (0..4u16)
             .flat_map(|y| (0..8u16).map(move |x| (x, y)))
             .filter(|(x, y)| (x + y) % 2 == 0 && (*x, *y) != (0, 0))
-            .map(|(x, y)| upgrade_tile(x, y, &raw))
+            .map(|(x, y)| match (x, y) {
+                (2, 0) => upgrade_tile_with_srl(x, y, &srl_a, &raw),
+                (5, 1) => upgrade_tile_with_srl(x, y, &srl_b, &raw),
+                _ => upgrade_tile(x, y, &raw),
+            })
             .collect();
         tiles.push(upgrade_tile(7, 0, &raw)); // never had a first pass
         tiles.push(first_tile(0, 0, TILE_FLAG_DIFFERENCE, &diff_a));
@@ -3895,19 +3960,19 @@ mod tests {
     #[test]
     fn characterization_multi_tile_frame() {
         let hash = characterization_hash(&mut ProgressiveDecoder::new());
-        expect!["f98f4e6082746e98"].assert_eq(&format!("{hash:016x}"));
+        expect!["81ba0a314ee7fd47"].assert_eq(&format!("{hash:016x}"));
     }
 
     #[test]
     fn characterization_error_mid_region() {
         let hash = error_mid_region_hash(&mut ProgressiveDecoder::new());
-        expect!["a2932fce0c0f6e34"].assert_eq(&format!("{hash:016x}"));
+        expect!["d7e8b7eef0c0a09b"].assert_eq(&format!("{hash:016x}"));
     }
 
     #[test]
     fn characterization_duplicate_tile() {
         let hash = duplicate_tile_hash(&mut ProgressiveDecoder::new());
-        expect!["8c8cb73e588d769b"].assert_eq(&format!("{hash:016x}"));
+        expect!["42bd225396bcbef4"].assert_eq(&format!("{hash:016x}"));
     }
 
     #[test]
