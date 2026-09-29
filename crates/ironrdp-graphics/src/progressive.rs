@@ -684,6 +684,64 @@ fn ycbcr_to_rgb(y: i16, cb: i16, cr: i16) -> [u8; 3] {
     [clamp_u8(r), clamp_u8(g), clamp_u8(b)]
 }
 
+/// `|cb|, |cr| <= FAST_CHROMA_LIMIT` keeps every product of [`ycbcr_to_rgb`] inside `i32`
+/// (`16384 * 116130 + 32768 < 2^31`); `y` is unrestricted because it is only added.
+const FAST_CHROMA_LIMIT: u16 = 16384;
+
+#[expect(
+    clippy::as_conversions,
+    clippy::cast_sign_loss,
+    reason = "value is clamped to 0..255 before cast"
+)]
+fn clamp_u8_i32(value: i32) -> u8 {
+    value.clamp(0, 255) as u8
+}
+
+/// [`ycbcr_to_rgb`] for a whole 64x64 tile, writing RGBA. Rows whose chroma fits
+/// [`FAST_CHROMA_LIMIT`] use `i32` arithmetic the compiler vectorises; other rows use the
+/// exact `i64` formula. Both give identical results for every input.
+#[expect(
+    clippy::arithmetic_side_effects,
+    reason = "cb/cr are bounded to |v| <= FAST_CHROMA_LIMIT (16384) by the `fits` check, so \
+              cb * 116130 + 32768 <= 16384 * 116130 + 32768 = 1_902_706_688 < i32::MAX and \
+              cb * 22554 + cr * 46802 + 32768 <= 16384 * (22554 + 46802) + 32768 = \
+              1_136_361_472 < i32::MAX; y is an i32::from(i16) + 128, well inside i32; the \
+              right-shifted results are then added to y with ample headroom below i32::MAX"
+)]
+fn ycbcr_to_rgba_tile(
+    y: &[i16; COEFFICIENTS_PER_COMPONENT],
+    cb: &[i16; COEFFICIENTS_PER_COMPONENT],
+    cr: &[i16; COEFFICIENTS_PER_COMPONENT],
+    pixels: &mut [u8],
+) {
+    const ROW: usize = 64;
+    let rows = pixels[..COEFFICIENTS_PER_COMPONENT * 4]
+        .chunks_exact_mut(ROW * 4)
+        .zip(y.chunks_exact(ROW).zip(cb.chunks_exact(ROW)).zip(cr.chunks_exact(ROW)));
+    for (out, ((y, cb), cr)) in rows {
+        let fits = cb
+            .iter()
+            .chain(cr.iter())
+            .all(|v| v.unsigned_abs() <= FAST_CHROMA_LIMIT);
+        if fits {
+            for (px, ((&y, &cb), &cr)) in out.chunks_exact_mut(4).zip(y.iter().zip(cb).zip(cr)) {
+                let y = i32::from(y) + 128;
+                let cb = i32::from(cb);
+                let cr = i32::from(cr);
+                px[0] = clamp_u8_i32(y + ((cr * 91881 + 32768) >> 16));
+                px[1] = clamp_u8_i32(y - ((cb * 22554 + cr * 46802 + 32768) >> 16));
+                px[2] = clamp_u8_i32(y + ((cb * 116130 + 32768) >> 16));
+                px[3] = 0xFF;
+            }
+        } else {
+            for (px, ((&y, &cb), &cr)) in out.chunks_exact_mut(4).zip(y.iter().zip(cb).zip(cr)) {
+                let [r, g, b] = ycbcr_to_rgb(y, cb, cr);
+                px.copy_from_slice(&[r, g, b, 0xFF]);
+            }
+        }
+    }
+}
+
 /// Clamp i32 to i16 range.
 #[expect(
     clippy::as_conversions,
@@ -1032,14 +1090,7 @@ impl TileState {
         }
 
         // YCbCr to RGBA conversion.
-        for i in 0..64 * 64 {
-            let [r, g, b] = ycbcr_to_rgb(y_buf[i], cb_buf[i], cr_buf[i]);
-            let off = i * 4;
-            pixels[off] = r;
-            pixels[off + 1] = g;
-            pixels[off + 2] = b;
-            pixels[off + 3] = 0xFF;
-        }
+        ycbcr_to_rgba_tile(&y_buf, &cb_buf, &cr_buf, pixels);
     }
 }
 
@@ -2720,6 +2771,71 @@ mod tests {
         ];
         for (y, cb, cr, expected) in cases {
             assert_eq!(ycbcr_to_rgb(y, cb, cr), expected, "y={y} cb={cb} cr={cr}");
+        }
+    }
+
+    #[test]
+    fn ycbcr_tile_conversion_matches_the_exact_formula() {
+        let edges: [i16; 13] = [
+            i16::MIN,
+            -32767,
+            -16385,
+            -16384,
+            -16383,
+            -4096,
+            -1,
+            0,
+            1,
+            4096,
+            16383,
+            16384,
+            i16::MAX,
+        ];
+        let mut samples = Vec::new();
+        for &y in &edges {
+            for &cb in &edges {
+                for &cr in &edges {
+                    samples.push((y, cb, cr));
+                }
+            }
+        }
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        while samples.len() < 64 * 64 * 40 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let bytes = state.to_le_bytes();
+            let pick = |i: usize| i16::from_le_bytes([bytes[i], bytes[i + 1]]);
+            // Mostly in-range values, some wide ones, so both paths run in most rows.
+            let narrow = |v: i16| v % 2048;
+            samples.push(if bytes[7].is_multiple_of(8) {
+                (pick(0), pick(2), pick(4))
+            } else {
+                (narrow(pick(0)), narrow(pick(2)), narrow(pick(4)))
+            });
+        }
+        for chunk in samples.chunks(64 * 64) {
+            let mut y = [0i16; COEFFICIENTS_PER_COMPONENT];
+            let mut cb = [0i16; COEFFICIENTS_PER_COMPONENT];
+            let mut cr = [0i16; COEFFICIENTS_PER_COMPONENT];
+            for (i, &(sy, scb, scr)) in chunk.iter().enumerate() {
+                y[i] = sy;
+                cb[i] = scb;
+                cr[i] = scr;
+            }
+            let mut fast = vec![0u8; 64 * 64 * 4];
+            ycbcr_to_rgba_tile(&y, &cb, &cr, &mut fast);
+            for i in 0..64 * 64 {
+                let [r, g, b] = ycbcr_to_rgb(y[i], cb[i], cr[i]);
+                assert_eq!(
+                    &fast[i * 4..i * 4 + 4],
+                    &[r, g, b, 0xFF],
+                    "sample {i}: ({}, {}, {})",
+                    y[i],
+                    cb[i],
+                    cr[i]
+                );
+            }
         }
     }
 
