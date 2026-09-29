@@ -1554,6 +1554,11 @@ impl ProgressiveDecoder {
             // REGION rectangles may be covered by tiles sent in an earlier REGION
             // within the same frame, so clip them against every tile currently
             // available for this frame rather than only the newly decoded tiles.
+            // Tiles present only for clip coverage are reconstructed after the loop, in parallel
+            // when enabled; nothing mutates `context.surface` during the loop, so deferred
+            // reconstruction from it afterward yields the same pixels as reconstructing inline.
+            // `decoded_tiles` keeps its order either way.
+            let mut repaint: Vec<usize> = Vec::new();
             for &(x_idx, y_idx) in frame_tiles.iter() {
                 charge_region_clipping_work(&mut region_clipping_work, clipping_region.rectangles.len().max(1))?;
                 let left = x_idx.saturating_mul(TILE_DIM);
@@ -1584,24 +1589,20 @@ impl ProgressiveDecoder {
                     continue;
                 }
 
-                let mut tile = if let Some(tile) = region_tiles.remove(&(x_idx, y_idx)) {
-                    tile
-                } else {
-                    let Some(tile_state) = context.surface.get(x_idx, y_idx) else {
-                        continue;
-                    };
-                    let mut pixels = vec![0u8; usize::from(TILE_DIM) * usize::from(TILE_DIM) * TILE_BYTES_PER_PIXEL];
-                    tile_state.reconstruct_to_rgba(&mut pixels);
-                    DecodedTile {
+                if let Some(mut tile) = region_tiles.remove(&(x_idx, y_idx)) {
+                    tile.update_rectangles = update_rectangles;
+                    decoded_tiles.push(tile);
+                } else if context.surface.get(x_idx, y_idx).is_some() {
+                    repaint.push(decoded_tiles.len());
+                    decoded_tiles.push(DecodedTile {
                         x_idx,
                         y_idx,
-                        pixels,
-                        update_rectangles: Vec::new(),
-                    }
-                };
-                tile.update_rectangles = update_rectangles;
-                decoded_tiles.push(tile);
+                        pixels: Vec::new(),
+                        update_rectangles,
+                    });
+                }
             }
+            reconstruct_repaints(&context.surface, &mut decoded_tiles, &repaint, parallel_min_tiles);
         }
 
         if !self.frame_active {
@@ -1764,6 +1765,42 @@ fn reconstructed(state: Box<TileState>) -> TileOutput {
     let mut pixels = vec![0u8; TILE_PIXEL_BYTES];
     state.reconstruct_to_rgba(&mut pixels);
     TileOutput::Decoded { state, pixels }
+}
+
+/// Fill the pixels of tiles repainted only for clip coverage from their current surface state.
+/// `repaint` holds indices into `tiles` that the clipping loop pushed with empty pixels; nothing
+/// mutates the surface between that loop and this call, so filling here (in any order) yields the
+/// same bytes as reconstructing inline.
+fn reconstruct_repaints(
+    surface: &SurfaceTiles,
+    tiles: &mut [DecodedTile],
+    repaint: &[usize],
+    parallel_min_tiles: usize,
+) {
+    let fill = |tile: &mut DecodedTile| {
+        if let Some(state) = surface.get(tile.x_idx, tile.y_idx) {
+            tile.pixels = vec![0u8; TILE_PIXEL_BYTES];
+            state.reconstruct_to_rgba(&mut tile.pixels);
+        }
+    };
+    #[cfg(feature = "parallel")]
+    if repaint.len() >= parallel_min_tiles {
+        if let Some(&first) = repaint.first() {
+            use rayon::prelude::*;
+            on_tile_pool(|| {
+                tiles[first..]
+                    .par_iter_mut()
+                    .enumerate()
+                    .filter(|(i, _)| repaint.binary_search(&i.saturating_add(first)).is_ok())
+                    .for_each(|(_, tile)| fill(tile));
+            });
+        }
+        return;
+    }
+    let _ = parallel_min_tiles;
+    for &index in repaint {
+        fill(&mut tiles[index]);
+    }
 }
 
 /// Decode a first-pass tile (SIMPLE when `quality` is `None`, FIRST otherwise). The checks run
