@@ -877,6 +877,7 @@ impl<'a> RawBitReader<'a> {
 /// accumulate refinement data.
 ///
 /// Memory per tile: ~37 KB (24 KB coefficients + 12 KB signs + metadata).
+#[derive(Clone)]
 pub struct TileState {
     /// Accumulated base-quantized DWT coefficients (`DecDwtQ`) per component (Y, Cb, Cr).
     pub coefficients: DecDwtQ,
@@ -1169,6 +1170,14 @@ impl SurfaceTiles {
     pub fn get(&self, x_idx: u16, y_idx: u16) -> Option<&TileState> {
         let idx = self.tile_index(x_idx, y_idx)?;
         self.tiles[idx].as_deref()
+    }
+
+    /// Store a tile's new state in its grid slot. Out-of-bounds indices are ignored:
+    /// [`decode_tile`] never produces state for them.
+    fn replace(&mut self, x_idx: u16, y_idx: u16, state: Box<TileState>) {
+        if let Some(index) = self.tile_index(x_idx, y_idx) {
+            self.tiles[index] = Some(state);
+        }
     }
 
     /// Reset all tiles (e.g., on context reset or surface resize).
@@ -1477,22 +1486,24 @@ impl ProgressiveDecoder {
                 _ => continue,
             };
 
+            let params = RegionParams {
+                surface_id,
+                quant_vals: &region.quant_vals,
+                prog_quant_vals: &region.quant_prog_vals,
+                use_reduce_extrapolate,
+            };
             let mut region_tiles = BTreeMap::new();
             for tile_block in &region.tiles {
-                let tiles = decode_tile_block(
-                    surface_id,
+                let outcome = decode_tile(&params, &context.surface, references, tile_block);
+                commit_tile(
                     &mut context.surface,
                     references,
-                    tile_block,
-                    &region.quant_vals,
-                    &region.quant_prog_vals,
-                    use_reduce_extrapolate,
+                    surface_id,
+                    tile_key(tile_block),
+                    outcome,
+                    frame_tiles,
+                    &mut region_tiles,
                 )?;
-                for tile in tiles {
-                    let key = (tile.x_idx, tile.y_idx);
-                    frame_tiles.insert(key);
-                    region_tiles.insert(key, tile);
-                }
             }
 
             let mut clipping_region = Region::new();
@@ -1635,173 +1646,201 @@ fn progressive_quant_for(
         })
 }
 
+/// What one REGION tile needs besides its own block.
+struct RegionParams<'a> {
+    surface_id: u16,
+    quant_vals: &'a [ComponentCodecQuant],
+    prog_quant_vals: &'a [ProgressiveCodecQuant],
+    use_reduce_extrapolate: bool,
+}
+
+/// Result of decoding one tile against the decoder state as it was before the tile.
+enum TileOutput {
+    /// An upgrade for a tile that never had a first pass: nothing to paint.
+    Skipped,
+    Decoded {
+        state: Box<TileState>,
+        pixels: Vec<u8>,
+    },
+}
+
+/// Bytes in one 64x64 RGBA tile (`TILE_DIM` squared; a literal because `usize::from` is not const).
+const TILE_PIXEL_BYTES: usize = 64 * 64 * TILE_BYTES_PER_PIXEL;
+
+fn tile_key(tile: &ironrdp_pdu::codecs::rfx::progressive::ProgressiveTile<'_>) -> (u16, u16) {
+    use ironrdp_pdu::codecs::rfx::progressive::ProgressiveTile;
+    match tile {
+        ProgressiveTile::Simple(t) => (t.x_idx, t.y_idx),
+        ProgressiveTile::First(t) => (t.x_idx, t.y_idx),
+        ProgressiveTile::Upgrade(t) => (t.x_idx, t.y_idx),
+    }
+}
+
+fn reconstructed(state: Box<TileState>) -> TileOutput {
+    let mut pixels = vec![0u8; TILE_PIXEL_BYTES];
+    state.reconstruct_to_rgba(&mut pixels);
+    TileOutput::Decoded { state, pixels }
+}
+
+/// Decode a first-pass tile (SIMPLE when `quality` is `None`, FIRST otherwise). The checks run
+/// in the order the serial decoder ran them, so the same input reports the same error.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "mirrors the TILE_SIMPLE/TILE_FIRST wire fields"
+)]
 #[expect(
     clippy::similar_names,
     reason = "q_y/q_cb/q_cr are standard component quant index names"
 )]
-fn decode_tile_block(
-    surface_id: u16,
+fn decode_first_tile(
+    params: &RegionParams<'_>,
+    surface: &SurfaceTiles,
+    references: &BTreeMap<SubBandDiffingTileKey, DecDwtQ>,
+    (x_idx, y_idx): (u16, u16),
+    flags: u8,
+    quant_idx: [u8; 3],
+    quality: Option<u8>,
+    data: [&[u8]; 3],
+) -> Result<TileOutput, ProgressiveDecodeError> {
+    if surface.tile_index(x_idx, y_idx).is_none() {
+        return Err(ProgressiveDecodeError::TileOutOfBounds { x_idx, y_idx });
+    }
+    let reference = if flags & TILE_FLAG_DIFFERENCE != 0 {
+        Some(
+            references
+                .get(&(params.surface_id, x_idx, y_idx))
+                .ok_or(ProgressiveDecodeError::MissingTileReference { x_idx, y_idx })?,
+        )
+    } else {
+        None
+    };
+    let [q_y, q_cb, q_cr] = quant_idx.map(usize::from);
+    if q_y >= params.quant_vals.len() || q_cb >= params.quant_vals.len() || q_cr >= params.quant_vals.len() {
+        return Err(ProgressiveDecodeError::InvalidQuantIndex {
+            index: q_y.max(q_cb).max(q_cr),
+            table_len: params.quant_vals.len(),
+        });
+    }
+    let (prog, quality) = match quality {
+        // TILE_SIMPLE: lossless progressive quant, full quality.
+        None => ([ComponentCodecQuant::LOSSLESS; 3], 0xFF),
+        Some(quality) => {
+            let pq = progressive_quant_for(quality, params.prog_quant_vals)?;
+            ([pq.y_quant, pq.cb_quant, pq.cr_quant], quality)
+        }
+    };
+    let mut state = Box::new(TileState::new());
+    state.decode_first_with_difference(
+        data,
+        [
+            &params.quant_vals[q_y],
+            &params.quant_vals[q_cb],
+            &params.quant_vals[q_cr],
+        ],
+        prog,
+        reference,
+        FirstPassOptions {
+            quant_idx,
+            quality,
+            use_reduce_extrapolate: params.use_reduce_extrapolate,
+        },
+    )?;
+    Ok(reconstructed(state))
+}
+
+/// Decode one REGION tile without touching decoder state. `decode_first_with_difference`
+/// assigns every `TileState` field, so decoding into a fresh state equals the serial decoder's
+/// in-place update.
+fn decode_tile(
+    params: &RegionParams<'_>,
+    surface: &SurfaceTiles,
+    references: &BTreeMap<SubBandDiffingTileKey, DecDwtQ>,
+    tile: &ironrdp_pdu::codecs::rfx::progressive::ProgressiveTile<'_>,
+) -> Result<TileOutput, ProgressiveDecodeError> {
+    use ironrdp_pdu::codecs::rfx::progressive::ProgressiveTile;
+    match tile {
+        ProgressiveTile::Simple(t) => decode_first_tile(
+            params,
+            surface,
+            references,
+            (t.x_idx, t.y_idx),
+            t.flags,
+            [t.quant_idx_y, t.quant_idx_cb, t.quant_idx_cr],
+            None,
+            [t.y_data, t.cb_data, t.cr_data],
+        ),
+        ProgressiveTile::First(t) => decode_first_tile(
+            params,
+            surface,
+            references,
+            (t.x_idx, t.y_idx),
+            t.flags,
+            [t.quant_idx_y, t.quant_idx_cb, t.quant_idx_cr],
+            Some(t.quality),
+            [t.y_data, t.cb_data, t.cr_data],
+        ),
+        ProgressiveTile::Upgrade(t) => {
+            let (x_idx, y_idx) = (t.x_idx, t.y_idx);
+            if surface.tile_index(x_idx, y_idx).is_none() {
+                return Err(ProgressiveDecodeError::TileOutOfBounds { x_idx, y_idx });
+            }
+            // No first pass yet (slot missing or pass 0): the serial decoder skipped it.
+            let Some(current) = surface.get(x_idx, y_idx).filter(|s| s.pass != 0) else {
+                return Ok(TileOutput::Skipped);
+            };
+            let pq = progressive_quant_for(t.quality, params.prog_quant_vals)?;
+            let mut state = Box::new(current.clone());
+            state.decode_upgrade(
+                [t.y_srl_data, t.cb_srl_data, t.cr_srl_data],
+                [t.y_raw_data, t.cb_raw_data, t.cr_raw_data],
+                [pq.y_quant, pq.cb_quant, pq.cr_quant],
+                t.quality,
+            )?;
+            Ok(reconstructed(state))
+        }
+    }
+}
+
+/// Apply one decoded tile to decoder state, reproducing the serial decoder's side effects
+/// exactly — including on error, where the serial decoder had already created the tile's grid
+/// slot unless the tile was out of bounds or missing its difference reference.
+fn commit_tile(
     surface: &mut SurfaceTiles,
     references: &mut BTreeMap<SubBandDiffingTileKey, DecDwtQ>,
-    tile_block: &ironrdp_pdu::codecs::rfx::progressive::ProgressiveTile<'_>,
-    quant_vals: &[ComponentCodecQuant],
-    prog_quant_vals: &[ProgressiveCodecQuant],
-    use_reduce_extrapolate: bool,
-) -> Result<Vec<DecodedTile>, ProgressiveDecodeError> {
-    use ironrdp_pdu::codecs::rfx::progressive::ProgressiveTile;
-
-    match tile_block {
-        ProgressiveTile::Simple(tile) => {
-            let x_idx = tile.x_idx;
-            let y_idx = tile.y_idx;
-            let is_difference = tile.flags & TILE_FLAG_DIFFERENCE != 0;
-
-            if surface.tile_index(x_idx, y_idx).is_none() {
-                return Err(ProgressiveDecodeError::TileOutOfBounds { x_idx, y_idx });
-            }
-            let reference_key = (surface_id, x_idx, y_idx);
-            let reference = if is_difference {
-                Some(
-                    references
-                        .get(&reference_key)
-                        .ok_or(ProgressiveDecodeError::MissingTileReference { x_idx, y_idx })?,
-                )
-            } else {
-                None
-            };
-            let tile_state = surface
-                .get_or_create(x_idx, y_idx)
-                .ok_or(ProgressiveDecodeError::TileOutOfBounds { x_idx, y_idx })?;
-
-            let q_y = usize::from(tile.quant_idx_y);
-            let q_cb = usize::from(tile.quant_idx_cb);
-            let q_cr = usize::from(tile.quant_idx_cr);
-
-            if q_y >= quant_vals.len() || q_cb >= quant_vals.len() || q_cr >= quant_vals.len() {
-                return Err(ProgressiveDecodeError::InvalidQuantIndex {
-                    index: q_y.max(q_cb).max(q_cr),
-                    table_len: quant_vals.len(),
-                });
-            }
-
-            // TILE_SIMPLE uses lossless progressive quant (no progressive refinement)
-            let prog = ComponentCodecQuant::LOSSLESS;
-
-            tile_state.decode_first_with_difference(
-                [tile.y_data, tile.cb_data, tile.cr_data],
-                [&quant_vals[q_y], &quant_vals[q_cb], &quant_vals[q_cr]],
-                [prog, prog, prog],
-                reference,
-                FirstPassOptions {
-                    quant_idx: [tile.quant_idx_y, tile.quant_idx_cb, tile.quant_idx_cr],
-                    quality: 0xFF, // full quality
-                    use_reduce_extrapolate,
-                },
-            )?;
-            references.insert(reference_key, tile_state.coefficients);
-
-            let mut pixels = vec![0u8; usize::from(TILE_DIM) * usize::from(TILE_DIM) * TILE_BYTES_PER_PIXEL];
-            tile_state.reconstruct_to_rgba(&mut pixels);
-
-            Ok(vec![DecodedTile {
-                x_idx,
-                y_idx,
-                pixels,
-                update_rectangles: Vec::new(),
-            }])
+    surface_id: u16,
+    (x_idx, y_idx): (u16, u16),
+    outcome: Result<TileOutput, ProgressiveDecodeError>,
+    frame_tiles: &mut BTreeSet<(u16, u16)>,
+    region_tiles: &mut BTreeMap<(u16, u16), DecodedTile>,
+) -> Result<(), ProgressiveDecodeError> {
+    match outcome {
+        Ok(TileOutput::Skipped) => {
+            surface.get_or_create(x_idx, y_idx);
+            Ok(())
         }
-
-        ProgressiveTile::First(tile) => {
-            let x_idx = tile.x_idx;
-            let y_idx = tile.y_idx;
-            let is_difference = tile.flags & TILE_FLAG_DIFFERENCE != 0;
-
-            if surface.tile_index(x_idx, y_idx).is_none() {
-                return Err(ProgressiveDecodeError::TileOutOfBounds { x_idx, y_idx });
-            }
-            let reference_key = (surface_id, x_idx, y_idx);
-            let reference = if is_difference {
-                Some(
-                    references
-                        .get(&reference_key)
-                        .ok_or(ProgressiveDecodeError::MissingTileReference { x_idx, y_idx })?,
-                )
-            } else {
-                None
-            };
-            let tile_state = surface
-                .get_or_create(x_idx, y_idx)
-                .ok_or(ProgressiveDecodeError::TileOutOfBounds { x_idx, y_idx })?;
-
-            let q_y = usize::from(tile.quant_idx_y);
-            let q_cb = usize::from(tile.quant_idx_cb);
-            let q_cr = usize::from(tile.quant_idx_cr);
-
-            if q_y >= quant_vals.len() || q_cb >= quant_vals.len() || q_cr >= quant_vals.len() {
-                return Err(ProgressiveDecodeError::InvalidQuantIndex {
-                    index: q_y.max(q_cb).max(q_cr),
-                    table_len: quant_vals.len(),
-                });
-            }
-
-            let pq = progressive_quant_for(tile.quality, prog_quant_vals)?;
-
-            tile_state.decode_first_with_difference(
-                [tile.y_data, tile.cb_data, tile.cr_data],
-                [&quant_vals[q_y], &quant_vals[q_cb], &quant_vals[q_cr]],
-                [pq.y_quant, pq.cb_quant, pq.cr_quant],
-                reference,
-                FirstPassOptions {
-                    quant_idx: [tile.quant_idx_y, tile.quant_idx_cb, tile.quant_idx_cr],
-                    quality: tile.quality,
-                    use_reduce_extrapolate,
+        Ok(TileOutput::Decoded { state, pixels }) => {
+            references.insert((surface_id, x_idx, y_idx), state.coefficients);
+            surface.replace(x_idx, y_idx, state);
+            frame_tiles.insert((x_idx, y_idx));
+            region_tiles.insert(
+                (x_idx, y_idx),
+                DecodedTile {
+                    x_idx,
+                    y_idx,
+                    pixels,
+                    update_rectangles: Vec::new(),
                 },
-            )?;
-            references.insert(reference_key, tile_state.coefficients);
-
-            let mut pixels = vec![0u8; usize::from(TILE_DIM) * usize::from(TILE_DIM) * TILE_BYTES_PER_PIXEL];
-            tile_state.reconstruct_to_rgba(&mut pixels);
-
-            Ok(vec![DecodedTile {
-                x_idx,
-                y_idx,
-                pixels,
-                update_rectangles: Vec::new(),
-            }])
+            );
+            Ok(())
         }
-
-        ProgressiveTile::Upgrade(tile) => {
-            let x_idx = tile.x_idx;
-            let y_idx = tile.y_idx;
-
-            let tile_state = surface
-                .get_or_create(x_idx, y_idx)
-                .ok_or(ProgressiveDecodeError::TileOutOfBounds { x_idx, y_idx })?;
-
-            // If this tile hasn't had a first pass, skip the upgrade
-            if tile_state.pass == 0 {
-                return Ok(Vec::new());
+        Err(error) => {
+            if !matches!(
+                error,
+                ProgressiveDecodeError::TileOutOfBounds { .. } | ProgressiveDecodeError::MissingTileReference { .. }
+            ) {
+                surface.get_or_create(x_idx, y_idx);
             }
-
-            let pq = progressive_quant_for(tile.quality, prog_quant_vals)?;
-
-            tile_state.decode_upgrade(
-                [tile.y_srl_data, tile.cb_srl_data, tile.cr_srl_data],
-                [tile.y_raw_data, tile.cb_raw_data, tile.cr_raw_data],
-                [pq.y_quant, pq.cb_quant, pq.cr_quant],
-                tile.quality,
-            )?;
-            references.insert((surface_id, x_idx, y_idx), tile_state.coefficients);
-
-            let mut pixels = vec![0u8; usize::from(TILE_DIM) * usize::from(TILE_DIM) * TILE_BYTES_PER_PIXEL];
-            tile_state.reconstruct_to_rgba(&mut pixels);
-
-            Ok(vec![DecodedTile {
-                x_idx,
-                y_idx,
-                pixels,
-                update_rectangles: Vec::new(),
-            }])
+            Err(error)
         }
     }
 }
