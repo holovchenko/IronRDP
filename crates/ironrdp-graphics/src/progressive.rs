@@ -1350,6 +1350,8 @@ pub struct ProgressiveDecoder {
     frame_tiles: BTreeMap<(u16, u32), BTreeSet<(u16, u16)>>,
     frame_active: bool,
     surface_context_flags: BTreeMap<u16, bool>,
+    /// Smallest REGION (in tiles) decoded on the thread pool; smaller ones decode inline.
+    parallel_min_tiles: usize,
 }
 
 impl ProgressiveDecoder {
@@ -1361,6 +1363,7 @@ impl ProgressiveDecoder {
             frame_tiles: BTreeMap::new(),
             frame_active: false,
             surface_context_flags: BTreeMap::new(),
+            parallel_min_tiles: PARALLEL_MIN_TILES,
         }
     }
 
@@ -1438,6 +1441,7 @@ impl ProgressiveDecoder {
         }
 
         let (contexts, references, all_frame_tiles) = (&mut self.contexts, &mut self.references, &mut self.frame_tiles);
+        let parallel_min_tiles = self.parallel_min_tiles;
 
         // Get or create the context for this (surface_id, codec_context_id).
         let context = match contexts.entry((surface_id, codec_context_id)) {
@@ -1493,17 +1497,38 @@ impl ProgressiveDecoder {
                 use_reduce_extrapolate,
             };
             let mut region_tiles = BTreeMap::new();
-            for tile_block in &region.tiles {
-                let outcome = decode_tile(&params, &context.surface, references, tile_block);
-                commit_tile(
-                    &mut context.surface,
-                    references,
-                    surface_id,
-                    tile_key(tile_block),
-                    outcome,
-                    frame_tiles,
-                    &mut region_tiles,
-                )?;
+            let batched = cfg!(feature = "parallel")
+                && region.tiles.len() >= parallel_min_tiles
+                && !has_repeated_tile(&region.tiles);
+            if batched {
+                #[cfg(feature = "parallel")]
+                {
+                    let outcomes = decode_region_tiles(&params, &context.surface, references, &region.tiles);
+                    for (tile_block, outcome) in region.tiles.iter().zip(outcomes) {
+                        commit_tile(
+                            &mut context.surface,
+                            references,
+                            surface_id,
+                            tile_key(tile_block),
+                            outcome,
+                            frame_tiles,
+                            &mut region_tiles,
+                        )?;
+                    }
+                }
+            } else {
+                for tile_block in &region.tiles {
+                    let outcome = decode_tile(&params, &context.surface, references, tile_block);
+                    commit_tile(
+                        &mut context.surface,
+                        references,
+                        surface_id,
+                        tile_key(tile_block),
+                        outcome,
+                        frame_tiles,
+                        &mut region_tiles,
+                    )?;
+                }
             }
 
             let mut clipping_region = Region::new();
@@ -1615,6 +1640,13 @@ impl ProgressiveDecoder {
         self.frame_tiles.clear();
         self.frame_active = false;
     }
+
+    /// Override the REGION-size threshold above which tiles decode on the thread pool. Used
+    /// only by `parallel_region_decode_matches_serial` to force each side of the comparison.
+    #[cfg(all(test, feature = "parallel"))]
+    fn set_parallel_min_tiles(&mut self, tiles: usize) {
+        self.parallel_min_tiles = tiles;
+    }
 }
 
 /// Resolve the progressive quantization values a tile's `quality` byte selects.
@@ -1667,6 +1699,9 @@ enum TileOutput {
 /// Bytes in one 64x64 RGBA tile (`TILE_DIM` squared; a literal because `usize::from` is not const).
 const TILE_PIXEL_BYTES: usize = 64 * 64 * TILE_BYTES_PER_PIXEL;
 
+/// Regions smaller than this decode inline: pool dispatch costs more than it saves.
+const PARALLEL_MIN_TILES: usize = 16;
+
 fn tile_key(tile: &ironrdp_pdu::codecs::rfx::progressive::ProgressiveTile<'_>) -> (u16, u16) {
     use ironrdp_pdu::codecs::rfx::progressive::ProgressiveTile;
     match tile {
@@ -1674,6 +1709,57 @@ fn tile_key(tile: &ironrdp_pdu::codecs::rfx::progressive::ProgressiveTile<'_>) -
         ProgressiveTile::First(t) => (t.x_idx, t.y_idx),
         ProgressiveTile::Upgrade(t) => (t.x_idx, t.y_idx),
     }
+}
+
+/// One thread fewer than the machine has, so the process presenting frames keeps a core.
+#[cfg(feature = "parallel")]
+fn tile_pool() -> &'static rayon::ThreadPool {
+    static POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| {
+        let threads = std::thread::available_parallelism().map_or(1, |n| n.get().saturating_sub(1).max(1));
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .thread_name(|i| format!("rfx-progressive-{i}"))
+            .build()
+            .expect("a pool with at least one thread builds")
+    })
+}
+
+/// Run `f` on the pool the caller is already on when the caller is a rayon worker thread,
+/// otherwise on the dedicated tile pool. Two reasons: a caller that configured its own rayon
+/// pool (as the equivalence test does, to prove 1/2/8-thread parity) has that choice respected
+/// instead of overridden, and a rayon worker thread is never blocked waiting on another pool,
+/// which risks starving both pools under nested `install` calls.
+#[cfg(feature = "parallel")]
+fn on_tile_pool<T: Send>(f: impl FnOnce() -> T + Send) -> T {
+    if rayon::current_thread_index().is_some() {
+        f()
+    } else {
+        tile_pool().install(f)
+    }
+}
+
+/// Decode every tile of a REGION with no repeated tile index against the state before the
+/// REGION. Without repeats, no tile reads state another tile of the same REGION writes.
+#[cfg(feature = "parallel")]
+fn decode_region_tiles(
+    params: &RegionParams<'_>,
+    surface: &SurfaceTiles,
+    references: &BTreeMap<SubBandDiffingTileKey, DecDwtQ>,
+    tiles: &[ironrdp_pdu::codecs::rfx::progressive::ProgressiveTile<'_>],
+) -> Vec<Result<TileOutput, ProgressiveDecodeError>> {
+    use rayon::prelude::*;
+    on_tile_pool(|| {
+        tiles
+            .par_iter()
+            .map(|tile| decode_tile(params, surface, references, tile))
+            .collect()
+    })
+}
+
+fn has_repeated_tile(tiles: &[ironrdp_pdu::codecs::rfx::progressive::ProgressiveTile<'_>]) -> bool {
+    let mut seen = BTreeSet::new();
+    !tiles.iter().all(|tile| seen.insert(tile_key(tile)))
 }
 
 fn reconstructed(state: Box<TileState>) -> TileOutput {
@@ -4128,6 +4214,49 @@ mod tests {
     fn characterization_duplicate_tile() {
         let hash = duplicate_tile_hash(&mut ProgressiveDecoder::new());
         expect!["42bd225396bcbef4"].assert_eq(&format!("{hash:016x}"));
+    }
+
+    /// The batched path must produce byte-identical output to the serial path, regardless of
+    /// which thread pool runs it: a caller-supplied pool of 1, 2 or 8 threads (mirroring how a
+    /// host application might configure rayon), and the dedicated tile pool used outside any
+    /// caller-chosen pool.
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn parallel_region_decode_matches_serial() {
+        type Fixture = fn(&mut ProgressiveDecoder) -> u64;
+        let fixtures: [(&str, Fixture); 3] = [
+            ("characterization_hash", characterization_hash),
+            ("error_mid_region_hash", error_mid_region_hash),
+            ("duplicate_tile_hash", duplicate_tile_hash),
+        ];
+
+        for (index, (name, fixture)) in fixtures.into_iter().enumerate() {
+            let mut serial = ProgressiveDecoder::new();
+            serial.set_parallel_min_tiles(usize::MAX);
+            let serial_hash = fixture(&mut serial);
+
+            for threads in [1usize, 2, 8] {
+                let pool = rayon::ThreadPoolBuilder::new()
+                    .num_threads(threads)
+                    .build()
+                    .expect("fixture pool with a fixed thread count builds");
+                let mut parallel = ProgressiveDecoder::new();
+                parallel.set_parallel_min_tiles(2);
+                let hash = pool.install(|| fixture(&mut parallel));
+                assert_eq!(
+                    serial_hash, hash,
+                    "fixture {index} ({name}) diverged from serial inside a {threads}-thread pool"
+                );
+            }
+
+            let mut parallel = ProgressiveDecoder::new();
+            parallel.set_parallel_min_tiles(2);
+            let hash = fixture(&mut parallel);
+            assert_eq!(
+                serial_hash, hash,
+                "fixture {index} ({name}) diverged from serial on the dedicated tile pool"
+            );
+        }
     }
 
     #[test]
