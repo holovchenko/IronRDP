@@ -1768,6 +1768,8 @@ impl Default for ProgressiveDecoder {
 #[cfg(test)]
 #[expect(clippy::as_conversions, clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
 mod tests {
+    use expect_test::expect;
+
     use super::*;
 
     fn minimal_progressive_stream(include_context: bool) -> Vec<u8> {
@@ -3432,6 +3434,480 @@ mod tests {
             )
             .expect("full-quality components should decode");
         state.coefficients
+    }
+
+    // -----------------------------------------------------------------
+    // Characterization fixtures: pin the current decoder's behaviour
+    // (output bytes, tile counts, error variants, retained state) so a
+    // later performance change (e.g. parallelizing REGION decode) can be
+    // checked against it byte-for-byte.
+    // -----------------------------------------------------------------
+
+    const FIXTURE_SURFACE: u16 = 1;
+    const FIXTURE_CONTEXT: u32 = 7;
+    const FIXTURE_WIDTH: u16 = 512; // 8 tiles
+    const FIXTURE_HEIGHT: u16 = 256; // 4 tiles
+
+    fn fnv(hash: &mut u64, bytes: &[u8]) {
+        for byte in bytes {
+            *hash ^= u64::from(*byte);
+            *hash = hash.wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+
+    fn hash_tiles(hash: &mut u64, tiles: &[DecodedTile]) {
+        for tile in tiles {
+            fnv(hash, &tile.x_idx.to_le_bytes());
+            fnv(hash, &tile.y_idx.to_le_bytes());
+            for r in &tile.update_rectangles {
+                for v in [r.left, r.top, r.right, r.bottom] {
+                    fnv(hash, &v.to_le_bytes());
+                }
+            }
+            fnv(hash, &tile.pixels);
+        }
+    }
+
+    /// Everything a later payload can observe: retained references and which grid slots exist.
+    fn hash_decoder_state(hash: &mut u64, decoder: &ProgressiveDecoder) {
+        for (key, reference) in &decoder.references {
+            fnv(hash, &key.0.to_le_bytes());
+            fnv(hash, &key.1.to_le_bytes());
+            fnv(hash, &key.2.to_le_bytes());
+            for component in reference {
+                for c in component {
+                    fnv(hash, &c.to_le_bytes());
+                }
+            }
+        }
+        if let Some(context) = decoder.contexts.get(&(FIXTURE_SURFACE, FIXTURE_CONTEXT)) {
+            for slot in &context.surface.tiles {
+                fnv(hash, &[u8::from(slot.is_some())]);
+                if let Some(state) = slot {
+                    fnv(hash, &state.pass.to_le_bytes());
+                    fnv(hash, &[state.quality, u8::from(state.is_difference)]);
+                }
+            }
+        }
+    }
+
+    fn fixture_base_quant() -> ComponentCodecQuant {
+        ComponentCodecQuant {
+            ll3: 6,
+            hl3: 6,
+            lh3: 6,
+            hh3: 6,
+            hl2: 6,
+            lh2: 6,
+            hh2: 6,
+            hl1: 6,
+            lh1: 6,
+            hh1: 6,
+        }
+    }
+
+    fn fixture_first_pass_quant() -> ComponentCodecQuant {
+        let mut quant = ComponentCodecQuant::LOSSLESS;
+        quant.ll3 = 1;
+        quant.hl1 = 2;
+        quant
+    }
+
+    /// RLGR1 data for a tile whose coefficients depend on its position and a seed.
+    fn fixture_component(x_idx: u16, y_idx: u16, seed: i16) -> Vec<u8> {
+        let mut coefficients = [0i16; COEFFICIENTS_PER_COMPONENT];
+        let x = i16::try_from(x_idx).unwrap();
+        let y = i16::try_from(y_idx).unwrap();
+        coefficients[4032] = x * 7 + y * 3 - 10 + seed;
+        coefficients[4033] = 20 - x + seed;
+        coefficients[usize::from(x_idx) * 131 + usize::from(y_idx) * 17] = 40 - y * 5;
+        coefficients[1024 + usize::from(x_idx) * 64] = seed - 3;
+        let mut encoded = vec![0; 16 * 1024];
+        let len =
+            crate::rlgr::encode(EntropyAlgorithm::Rlgr1, &coefficients, &mut encoded).expect("fixture RLGR encode");
+        encoded.truncate(len);
+        encoded
+    }
+
+    fn fixture_stream(
+        include_context: bool,
+        rects: Vec<ironrdp_pdu::codecs::rfx::RfxRectangle>,
+        tiles: Vec<ironrdp_pdu::codecs::rfx::progressive::ProgressiveTile<'_>>,
+    ) -> Vec<u8> {
+        use ironrdp_pdu::codecs::rfx::progressive::{
+            ProgressiveBlock, ProgressiveContextPdu, ProgressiveFrameBeginPdu, ProgressiveFrameEndPdu,
+            ProgressiveRegion, ProgressiveSyncPdu, encode_progressive_stream,
+        };
+        let mut blocks = vec![ProgressiveBlock::Sync(ProgressiveSyncPdu)];
+        if include_context {
+            blocks.push(ProgressiveBlock::Context(ProgressiveContextPdu {
+                context_id: 0,
+                tile_size: 0x0040,
+                flags: 0,
+            }));
+        }
+        blocks.extend([
+            ProgressiveBlock::FrameBegin(ProgressiveFrameBeginPdu {
+                frame_index: 0,
+                region_count: 1,
+            }),
+            ProgressiveBlock::Region(ProgressiveRegion {
+                tile_size: 0x40,
+                rects,
+                quant_vals: vec![fixture_base_quant()],
+                quant_prog_vals: vec![
+                    ProgressiveCodecQuant {
+                        quality: 0,
+                        y_quant: fixture_first_pass_quant(),
+                        cb_quant: fixture_first_pass_quant(),
+                        cr_quant: fixture_first_pass_quant(),
+                    },
+                    ProgressiveCodecQuant {
+                        quality: 1,
+                        y_quant: ComponentCodecQuant::LOSSLESS,
+                        cb_quant: ComponentCodecQuant::LOSSLESS,
+                        cr_quant: ComponentCodecQuant::LOSSLESS,
+                    },
+                ],
+                flags: 0,
+                tiles,
+            }),
+            ProgressiveBlock::FrameEnd(ProgressiveFrameEndPdu),
+        ]);
+        encode_progressive_stream(&blocks).expect("fixture stream encodes")
+    }
+
+    fn whole_surface_rect() -> Vec<ironrdp_pdu::codecs::rfx::RfxRectangle> {
+        vec![ironrdp_pdu::codecs::rfx::RfxRectangle {
+            x: 0,
+            y: 0,
+            width: FIXTURE_WIDTH,
+            height: FIXTURE_HEIGHT,
+        }]
+    }
+
+    fn first_tile<'a>(
+        x_idx: u16,
+        y_idx: u16,
+        flags: u8,
+        data: &'a [u8],
+    ) -> ironrdp_pdu::codecs::rfx::progressive::ProgressiveTile<'a> {
+        ironrdp_pdu::codecs::rfx::progressive::ProgressiveTile::First(
+            ironrdp_pdu::codecs::rfx::progressive::TileFirst {
+                quant_idx_y: 0,
+                quant_idx_cb: 0,
+                quant_idx_cr: 0,
+                x_idx,
+                y_idx,
+                flags,
+                quality: 0,
+                y_data: data,
+                cb_data: data,
+                cr_data: data,
+                tail_data: &[],
+            },
+        )
+    }
+
+    /// Like [`first_tile`] but with an explicit `quality` byte, so a fixture can force
+    /// [`ProgressiveDecodeError::InvalidQuantIndex`] against the 2-entry fixture progressive
+    /// quant table. `quant_idx_y/cb/cr` (the *component* quant table index) can't be used for
+    /// this: `ProgressiveRegion::decode` validates those against `quant_vals.len()` while
+    /// parsing the wire bytes, so an out-of-range value fails the whole REGION's PDU decode
+    /// (`ProgressiveDecodeError::Pdu`) before any tile is processed, instead of failing one
+    /// tile mid-region. `quality` indexes `quant_prog_vals`, which the PDU layer does not
+    /// validate, so its range check only happens per tile in [`progressive_quant_for`].
+    fn first_tile_bad_quality<'a>(
+        x_idx: u16,
+        y_idx: u16,
+        quality: u8,
+        flags: u8,
+        data: &'a [u8],
+    ) -> ironrdp_pdu::codecs::rfx::progressive::ProgressiveTile<'a> {
+        ironrdp_pdu::codecs::rfx::progressive::ProgressiveTile::First(
+            ironrdp_pdu::codecs::rfx::progressive::TileFirst {
+                quant_idx_y: 0,
+                quant_idx_cb: 0,
+                quant_idx_cr: 0,
+                x_idx,
+                y_idx,
+                flags,
+                quality,
+                y_data: data,
+                cb_data: data,
+                cr_data: data,
+                tail_data: &[],
+            },
+        )
+    }
+
+    fn upgrade_tile<'a>(
+        x_idx: u16,
+        y_idx: u16,
+        raw: &'a [u8],
+    ) -> ironrdp_pdu::codecs::rfx::progressive::ProgressiveTile<'a> {
+        ironrdp_pdu::codecs::rfx::progressive::ProgressiveTile::Upgrade(
+            ironrdp_pdu::codecs::rfx::progressive::TileUpgrade {
+                quant_idx_y: 0,
+                quant_idx_cb: 0,
+                quant_idx_cr: 0,
+                x_idx,
+                y_idx,
+                quality: 1,
+                y_srl_data: &[],
+                y_raw_data: raw,
+                cb_srl_data: &[],
+                cb_raw_data: raw,
+                cr_srl_data: &[],
+                cr_raw_data: raw,
+            },
+        )
+    }
+
+    /// Three payloads in one RDPGFX frame: 32 first-pass tiles; 18 upgrades + difference
+    /// tiles (one upgrade on a tile with no first pass); one simple tile whose REGION rect also
+    /// covers tiles from earlier payloads (clip-coverage repaint).
+    fn characterization_hash(decoder: &mut ProgressiveDecoder) -> u64 {
+        let mut hash = 0xcbf2_9ce4_8422_2325u64;
+        decoder.begin_frame();
+
+        let first_data: Vec<Vec<u8>> = (0..4u16)
+            .flat_map(|y| (0..8u16).map(move |x| (x, y)))
+            .map(|(x, y)| fixture_component(x, y, 0))
+            .collect();
+        let tiles = (0..4u16)
+            .flat_map(|y| (0..8u16).map(move |x| (x, y)))
+            .zip(&first_data)
+            // (7, 0) deliberately has no first pass: payload 2 upgrades it.
+            .filter(|((x, y), _)| (*x, *y) != (7, 0))
+            .map(|((x, y), data)| first_tile(x, y, 0, data))
+            .collect();
+        let tiles_out = decoder
+            .decode_bitmap(
+                FIXTURE_SURFACE,
+                FIXTURE_CONTEXT,
+                FIXTURE_WIDTH,
+                FIXTURE_HEIGHT,
+                &fixture_stream(true, whole_surface_rect(), tiles),
+            )
+            .expect("payload 1 decodes");
+        hash_tiles(&mut hash, &tiles_out);
+
+        let raw = [0xA5u8; 8];
+        let diff_a = fixture_component(0, 0, 5);
+        let diff_b = fixture_component(6, 3, -4);
+        let mut tiles: Vec<_> = (0..4u16)
+            .flat_map(|y| (0..8u16).map(move |x| (x, y)))
+            .filter(|(x, y)| (x + y) % 2 == 0 && (*x, *y) != (0, 0))
+            .map(|(x, y)| upgrade_tile(x, y, &raw))
+            .collect();
+        tiles.push(upgrade_tile(7, 0, &raw)); // never had a first pass
+        tiles.push(first_tile(0, 0, TILE_FLAG_DIFFERENCE, &diff_a));
+        tiles.push(first_tile(6, 3, TILE_FLAG_DIFFERENCE, &diff_b));
+        let tiles_out = decoder
+            .decode_bitmap(
+                FIXTURE_SURFACE,
+                FIXTURE_CONTEXT,
+                FIXTURE_WIDTH,
+                FIXTURE_HEIGHT,
+                &fixture_stream(false, whole_surface_rect(), tiles),
+            )
+            .expect("payload 2 decodes");
+        hash_tiles(&mut hash, &tiles_out);
+
+        let simple = [
+            encode_full_quality_component(30),
+            encode_full_quality_component(-12),
+            encode_full_quality_component(9),
+        ];
+        let tiles = vec![ironrdp_pdu::codecs::rfx::progressive::ProgressiveTile::Simple(
+            ironrdp_pdu::codecs::rfx::progressive::TileSimple {
+                quant_idx_y: 0,
+                quant_idx_cb: 0,
+                quant_idx_cr: 0,
+                x_idx: 2,
+                y_idx: 2,
+                flags: 0,
+                y_data: &simple[0],
+                cb_data: &simple[1],
+                cr_data: &simple[2],
+                tail_data: &[],
+            },
+        )];
+        let rects = vec![ironrdp_pdu::codecs::rfx::RfxRectangle {
+            x: 100,
+            y: 50,
+            width: 260,
+            height: 170,
+        }];
+        let tiles_out = decoder
+            .decode_bitmap(
+                FIXTURE_SURFACE,
+                FIXTURE_CONTEXT,
+                FIXTURE_WIDTH,
+                FIXTURE_HEIGHT,
+                &fixture_stream(false, rects, tiles),
+            )
+            .expect("payload 3 decodes");
+        hash_tiles(&mut hash, &tiles_out);
+
+        decoder.end_frame();
+        hash_decoder_state(&mut hash, decoder);
+        hash
+    }
+
+    /// Exercises the three ways a mid-REGION tile can fail, and what each leaves behind, then
+    /// confirms a full upgrade payload still decodes after all three failures:
+    ///
+    /// (a) 20 first-pass tiles where tile 10 is out of bounds (99, 0) *and* tile 14 also has an
+    ///     invalid progressive quant index (`quality = 5` against the 2-entry fixture
+    ///     `quant_prog_vals` table). The out-of-bounds check runs first in tile order, so it
+    ///     wins and tile 14's bad index never takes effect: `Err(TileOutOfBounds { x_idx: 99,
+    ///     .. })`, with tiles 0-9 already committed and tiles 11-19 never reached.
+    /// (b) A fresh 16-tile REGION (grid row y = 2, x = 0..8) that no earlier payload touched,
+    ///     where the 6th tile (x = 5, y = 2) has an invalid progressive quant index. Tiles 0-4
+    ///     commit (decoded and referenced); tile 5's grid slot is still created with
+    ///     `pass == 0` because the serial `get_or_create` runs before the quant-index check;
+    ///     tiles 6-15 are never touched: `Err(InvalidQuantIndex { .. })`.
+    /// (c) A 16-tile REGION built entirely from grid slots neither (a) nor (b) touched, where
+    ///     the 6th tile is a DIFFERENCE first-pass tile for a coordinate with no retained
+    ///     reference. The reference lookup runs before `get_or_create`, so no grid slot is
+    ///     created for the failing tile; the first 5 tiles commit normally, and the rest are
+    ///     never touched: `Err(MissingTileReference { .. })`.
+    /// (d) The 32-tile upgrade payload (one upgrade per grid slot) always decodes `Ok`
+    ///     regardless of the state left behind by (a)-(c), because a slot with no first pass
+    ///     (`pass == 0`) is silently skipped rather than erroring.
+    fn error_mid_region_hash(decoder: &mut ProgressiveDecoder) -> u64 {
+        let mut hash = 0xcbf2_9ce4_8422_2325u64;
+
+        // (a) an out-of-bounds tile beats a later bad-quant-index tile in the same REGION.
+        let data: Vec<Vec<u8>> = (0..20u16).map(|i| fixture_component(i % 8, i / 8, 1)).collect();
+        let mut tiles: Vec<_> = (0..20u16)
+            .map(|i| first_tile(i % 8, i / 8, 0, &data[usize::from(i)]))
+            .collect();
+        tiles[10] = first_tile(99, 0, 0, &data[10]);
+        tiles[14] = first_tile_bad_quality(14 % 8, 14 / 8, 5, 0, &data[14]);
+        let result = decoder.decode_bitmap(
+            FIXTURE_SURFACE,
+            FIXTURE_CONTEXT,
+            FIXTURE_WIDTH,
+            FIXTURE_HEIGHT,
+            &fixture_stream(true, whole_surface_rect(), tiles),
+        );
+        fnv(&mut hash, format!("{:?}", result.err()).as_bytes());
+        hash_decoder_state(&mut hash, decoder);
+
+        // (b) a 16-tile region of untouched slots where the 6th tile has a bad quant index;
+        // its grid slot is created (pass == 0) before the quant check runs.
+        let row_data: Vec<Vec<u8>> = (0..16u16).map(|i| fixture_component(i, 2, 3)).collect();
+        let mut tiles: Vec<_> = (0..16u16)
+            .map(|i| first_tile(i, 2, 0, &row_data[usize::from(i)]))
+            .collect();
+        tiles[5] = first_tile_bad_quality(5, 2, 5, 0, &row_data[5]);
+        let result = decoder.decode_bitmap(
+            FIXTURE_SURFACE,
+            FIXTURE_CONTEXT,
+            FIXTURE_WIDTH,
+            FIXTURE_HEIGHT,
+            &fixture_stream(false, whole_surface_rect(), tiles),
+        );
+        fnv(&mut hash, format!("{:?}", result.err()).as_bytes());
+        hash_decoder_state(&mut hash, decoder);
+
+        // (c) 16 tiles that neither (a) nor (b) touched, where the 6th is a difference tile
+        // with no retained reference; no grid slot is created for it.
+        let coords: [(u16, u16); 16] = [
+            (2, 1),
+            (3, 1),
+            (4, 1),
+            (5, 1),
+            (6, 1),
+            (7, 1),
+            (6, 2),
+            (7, 2),
+            (0, 3),
+            (1, 3),
+            (2, 3),
+            (3, 3),
+            (4, 3),
+            (5, 3),
+            (6, 3),
+            (7, 3),
+        ];
+        let free_data: Vec<Vec<u8>> = coords.iter().map(|&(x, y)| fixture_component(x, y, 4)).collect();
+        let diff_data = fixture_component(7, 1, 9);
+        let mut tiles: Vec<_> = coords
+            .iter()
+            .zip(&free_data)
+            .map(|(&(x, y), data)| first_tile(x, y, 0, data))
+            .collect();
+        tiles[5] = first_tile(7, 1, TILE_FLAG_DIFFERENCE, &diff_data);
+        let result = decoder.decode_bitmap(
+            FIXTURE_SURFACE,
+            FIXTURE_CONTEXT,
+            FIXTURE_WIDTH,
+            FIXTURE_HEIGHT,
+            &fixture_stream(false, whole_surface_rect(), tiles),
+        );
+        fnv(&mut hash, format!("{:?}", result.err()).as_bytes());
+        hash_decoder_state(&mut hash, decoder);
+
+        // (d) a full 32-tile upgrade payload still decodes after all three failures above.
+        let raw = [0x3Cu8; 8];
+        let tiles = (0..32u16).map(|i| upgrade_tile(i % 8, i / 8, &raw)).collect();
+        let out = decoder
+            .decode_bitmap(
+                FIXTURE_SURFACE,
+                FIXTURE_CONTEXT,
+                FIXTURE_WIDTH,
+                FIXTURE_HEIGHT,
+                &fixture_stream(false, whole_surface_rect(), tiles),
+            )
+            .expect("upgrade payload decodes");
+        hash_tiles(&mut hash, &out);
+        hash_decoder_state(&mut hash, decoder);
+        hash
+    }
+
+    /// 20 tiles where (2, 1) appears as a first pass and later as a difference tile.
+    fn duplicate_tile_hash(decoder: &mut ProgressiveDecoder) -> u64 {
+        let mut hash = 0xcbf2_9ce4_8422_2325u64;
+        let data: Vec<Vec<u8>> = (0..19u16).map(|i| fixture_component(i % 8, i / 8, 2)).collect();
+        let diff = fixture_component(2, 1, 11);
+        let mut tiles: Vec<_> = (0..19u16)
+            .map(|i| first_tile(i % 8, i / 8, 0, &data[usize::from(i)]))
+            .collect();
+        tiles.push(first_tile(2, 1, TILE_FLAG_DIFFERENCE, &diff));
+        let out = decoder
+            .decode_bitmap(
+                FIXTURE_SURFACE,
+                FIXTURE_CONTEXT,
+                FIXTURE_WIDTH,
+                FIXTURE_HEIGHT,
+                &fixture_stream(true, whole_surface_rect(), tiles),
+            )
+            .expect("duplicate payload decodes");
+        hash_tiles(&mut hash, &out);
+        hash_decoder_state(&mut hash, decoder);
+        hash
+    }
+
+    #[test]
+    fn characterization_multi_tile_frame() {
+        let hash = characterization_hash(&mut ProgressiveDecoder::new());
+        expect!["f98f4e6082746e98"].assert_eq(&format!("{hash:016x}"));
+    }
+
+    #[test]
+    fn characterization_error_mid_region() {
+        let hash = error_mid_region_hash(&mut ProgressiveDecoder::new());
+        expect!["a2932fce0c0f6e34"].assert_eq(&format!("{hash:016x}"));
+    }
+
+    #[test]
+    fn characterization_duplicate_tile() {
+        let hash = duplicate_tile_hash(&mut ProgressiveDecoder::new());
+        expect!["8c8cb73e588d769b"].assert_eq(&format!("{hash:016x}"));
     }
 
     #[test]
