@@ -1497,24 +1497,33 @@ impl ProgressiveDecoder {
                 use_reduce_extrapolate,
             };
             let mut region_tiles = BTreeMap::new();
-            let batched = cfg!(feature = "parallel")
-                && region.tiles.len() >= parallel_min_tiles
-                && !has_repeated_tile(&region.tiles);
-            if batched {
-                #[cfg(feature = "parallel")]
-                {
-                    let outcomes = decode_region_tiles(&params, &context.surface, references, &region.tiles);
-                    for (tile_block, outcome) in region.tiles.iter().zip(outcomes) {
-                        commit_tile(
-                            &mut context.surface,
-                            references,
-                            surface_id,
-                            tile_key(tile_block),
-                            outcome,
-                            frame_tiles,
-                            &mut region_tiles,
-                        )?;
-                    }
+            // `batched_outcomes` is `Some` only when the `parallel` feature is enabled, the
+            // dedicated tile pool built successfully (see `tile_pool`/`resolve_batch_pool`), and
+            // the REGION is large enough and free of same-REGION repeats to be worth dispatching.
+            // Otherwise (feature off, pool build failed, or thresholds unmet) it stays `None` and
+            // the loop below decodes every tile serially, exactly as the pre-parallel decoder did.
+            #[cfg(feature = "parallel")]
+            let batched_outcomes = resolve_batch_pool(
+                tile_pool(),
+                region.tiles.len(),
+                parallel_min_tiles,
+                !has_repeated_tile(&region.tiles),
+            )
+            .map(|pool| decode_region_tiles(pool, &params, &context.surface, references, &region.tiles));
+            #[cfg(not(feature = "parallel"))]
+            let batched_outcomes: Option<Vec<Result<TileOutput, ProgressiveDecodeError>>> = None;
+
+            if let Some(outcomes) = batched_outcomes {
+                for (tile_block, outcome) in region.tiles.iter().zip(outcomes) {
+                    commit_tile(
+                        &mut context.surface,
+                        references,
+                        surface_id,
+                        tile_key(tile_block),
+                        outcome,
+                        frame_tiles,
+                        &mut region_tiles,
+                    )?;
                 }
             } else {
                 for tile_block in &region.tiles {
@@ -1709,29 +1718,65 @@ fn tile_key(tile: &ironrdp_pdu::codecs::rfx::progressive::ProgressiveTile<'_>) -
     }
 }
 
-/// One thread fewer than the machine has, so the process presenting frames keeps a core.
+/// Resolve how many threads the dedicated tile pool should use.
+///
+/// `RAYON_NUM_THREADS`, when set to a positive integer, overrides the default so an operator can
+/// size the pool explicitly (e.g. when each RDP session is its own worker process and several
+/// sessions share a machine, `available_parallelism() - 1` per process oversubscribes the box).
+/// Any other value (unset, non-numeric, zero, or negative) falls back to one thread fewer than
+/// the machine has, so a single process still keeps a core free for presenting frames.
 #[cfg(feature = "parallel")]
-fn tile_pool() -> &'static rayon::ThreadPool {
-    static POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
+fn resolve_pool_threads(rayon_num_threads: Option<&str>, available_parallelism: usize) -> usize {
+    rayon_num_threads
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|&threads| threads > 0)
+        .unwrap_or_else(|| available_parallelism.saturating_sub(1).max(1))
+}
+
+/// The dedicated tile pool, or `None` when it failed to build (e.g. the OS refused to create
+/// threads under resource exhaustion). Sized by [`resolve_pool_threads`]; see its doc comment for
+/// the `RAYON_NUM_THREADS` override.
+#[cfg(feature = "parallel")]
+fn tile_pool() -> Option<&'static rayon::ThreadPool> {
+    static POOL: std::sync::OnceLock<Option<rayon::ThreadPool>> = std::sync::OnceLock::new();
     POOL.get_or_init(|| {
-        let threads = std::thread::available_parallelism().map_or(1, |n| n.get().saturating_sub(1).max(1));
+        let available = std::thread::available_parallelism().map_or(1, |n| n.get());
+        let threads = resolve_pool_threads(std::env::var("RAYON_NUM_THREADS").ok().as_deref(), available);
         rayon::ThreadPoolBuilder::new()
             .num_threads(threads)
             .thread_name(|i| format!("rfx-progressive-{i}"))
             .build()
-            .expect("a pool with at least one thread builds")
+            .ok()
     })
+    .as_ref()
 }
 
-/// Run `f` on the caller's own rayon pool when already on one, otherwise on the dedicated tile
-/// pool: a caller-chosen pool is respected rather than overridden, and a rayon worker thread is
-/// never blocked waiting on another pool.
+/// Whether a batch of `work_len` items should run on `pool`: `pool` must exist (the dedicated
+/// pool built successfully, or a caller supplied one for a test) and the batch must be large
+/// enough, and free of same-REGION repeats, for pool dispatch to pay for itself. Kept pure and
+/// separate from `tile_pool()` so the fallback decision is unit-testable without exhausting OS
+/// threads to force a build failure.
 #[cfg(feature = "parallel")]
-fn on_tile_pool<T: Send>(f: impl FnOnce() -> T + Send) -> T {
+fn resolve_batch_pool(
+    pool: Option<&rayon::ThreadPool>,
+    work_len: usize,
+    min_tiles: usize,
+    eligible: bool,
+) -> Option<&rayon::ThreadPool> {
+    if work_len >= min_tiles && eligible { pool } else { None }
+}
+
+/// Run `f` on the caller's own rayon pool when already on one, otherwise on `pool`: a
+/// caller-chosen pool is respected rather than overridden, and a rayon worker thread is never
+/// blocked waiting on another pool. `pool` must be `Some`; callers only reach this after
+/// `resolve_batch_pool` confirmed a pool is available, so the batched/parallel path never runs
+/// when the dedicated pool failed to build.
+#[cfg(feature = "parallel")]
+fn on_tile_pool<T: Send>(pool: &rayon::ThreadPool, f: impl FnOnce() -> T + Send) -> T {
     if rayon::current_thread_index().is_some() {
         f()
     } else {
-        tile_pool().install(f)
+        pool.install(f)
     }
 }
 
@@ -1739,13 +1784,14 @@ fn on_tile_pool<T: Send>(f: impl FnOnce() -> T + Send) -> T {
 /// REGION. Without repeats, no tile reads state another tile of the same REGION writes.
 #[cfg(feature = "parallel")]
 fn decode_region_tiles(
+    pool: &rayon::ThreadPool,
     params: &RegionParams<'_>,
     surface: &SurfaceTiles,
     references: &BTreeMap<SubBandDiffingTileKey, DecDwtQ>,
     tiles: &[ironrdp_pdu::codecs::rfx::progressive::ProgressiveTile<'_>],
 ) -> Vec<Result<TileOutput, ProgressiveDecodeError>> {
     use rayon::prelude::*;
-    on_tile_pool(|| {
+    on_tile_pool(pool, || {
         tiles
             .par_iter()
             .map(|tile| decode_tile(params, surface, references, tile))
@@ -1753,6 +1799,7 @@ fn decode_region_tiles(
     })
 }
 
+#[cfg(feature = "parallel")]
 fn has_repeated_tile(tiles: &[ironrdp_pdu::codecs::rfx::progressive::ProgressiveTile<'_>]) -> bool {
     let mut seen = BTreeSet::new();
     !tiles.iter().all(|tile| seen.insert(tile_key(tile)))
@@ -1781,10 +1828,10 @@ fn reconstruct_repaints(
         }
     };
     #[cfg(feature = "parallel")]
-    if repaint.len() >= parallel_min_tiles {
+    if let Some(pool) = resolve_batch_pool(tile_pool(), repaint.len(), parallel_min_tiles, true) {
         if let Some(&first) = repaint.first() {
             use rayon::prelude::*;
-            on_tile_pool(|| {
+            on_tile_pool(pool, || {
                 tiles[first..]
                     .par_iter_mut()
                     .enumerate()
@@ -4289,6 +4336,50 @@ mod tests {
                 "fixture {index} ({name}) diverged from serial on the dedicated tile pool"
             );
         }
+    }
+
+    /// A build failure (`tile_pool()` returning `None`, e.g. the OS refused to create threads)
+    /// must fall back to the serial path rather than panic. Exercised through `resolve_batch_pool`
+    /// so the test never needs to actually exhaust OS threads.
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn resolve_batch_pool_falls_back_when_pool_is_absent() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .expect("fixture pool with one thread builds");
+
+        // No pool (build failed): never batch, regardless of size or eligibility.
+        assert!(resolve_batch_pool(None, 100, 16, true).is_none());
+
+        // Pool present, but below the size threshold or containing a repeated tile: stay serial.
+        assert!(resolve_batch_pool(Some(&pool), 4, 16, true).is_none());
+        assert!(resolve_batch_pool(Some(&pool), 100, 16, false).is_none());
+
+        // Pool present, large enough, and eligible: batch on it.
+        assert!(resolve_batch_pool(Some(&pool), 100, 16, true).is_some());
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn resolve_pool_threads_prefers_a_valid_rayon_num_threads_override() {
+        assert_eq!(resolve_pool_threads(Some("4"), 8), 4);
+        assert_eq!(resolve_pool_threads(Some("1"), 8), 1);
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn resolve_pool_threads_falls_back_to_available_parallelism_minus_one() {
+        // Unset, empty, non-numeric, zero, and negative overrides are all ignored.
+        for invalid in [None, Some(""), Some("not-a-number"), Some("0"), Some("-1")] {
+            assert_eq!(
+                resolve_pool_threads(invalid, 8),
+                7,
+                "override {invalid:?} should be ignored"
+            );
+        }
+        // The floor is one thread, even on a single-core machine.
+        assert_eq!(resolve_pool_threads(None, 1), 1);
     }
 
     #[test]
