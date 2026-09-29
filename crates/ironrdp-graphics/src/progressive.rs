@@ -1725,11 +1725,9 @@ fn tile_pool() -> &'static rayon::ThreadPool {
     })
 }
 
-/// Run `f` on the pool the caller is already on when the caller is a rayon worker thread,
-/// otherwise on the dedicated tile pool. Two reasons: a caller that configured its own rayon
-/// pool (as the equivalence test does, to prove 1/2/8-thread parity) has that choice respected
-/// instead of overridden, and a rayon worker thread is never blocked waiting on another pool,
-/// which risks starving both pools under nested `install` calls.
+/// Run `f` on the caller's own rayon pool when already on one, otherwise on the dedicated tile
+/// pool: a caller-chosen pool is respected rather than overridden, and a rayon worker thread is
+/// never blocked waiting on another pool.
 #[cfg(feature = "parallel")]
 fn on_tile_pool<T: Send>(f: impl FnOnce() -> T + Send) -> T {
     if rayon::current_thread_index().is_some() {

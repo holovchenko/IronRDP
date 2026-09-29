@@ -16,6 +16,11 @@ categories.workspace = true
 doctest = false
 # test = false
 
+[features]
+# Decode the tiles of large RFX Progressive REGIONs on a dedicated thread pool. Off by default
+# (wasm has no threads); desktop clients opt in.
+parallel = ["dep:rayon"]
+
 [dependencies]
 bit_field = "0.10"
 bitflags = "2.11"
@@ -33,11 +38,6 @@ rayon = { version = "1.12", optional = true }
 bmp = "0.5"
 bytemuck = "1.24"
 expect-test.workspace = true
-
-[features]
-# Decode the tiles of large RFX Progressive REGIONs on a dedicated thread pool. Off by default
-# (wasm has no threads); desktop clients opt in.
-parallel = ["dep:rayon"]
 
 [lints]
 workspace = true
