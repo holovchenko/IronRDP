@@ -375,4 +375,127 @@ mod tests {
         assert!(!is_painted(&image, 119, 120));
         assert!(!is_painted(&image, 120, 119));
     }
+
+    fn any_painted(image: &DecodedImage) -> bool {
+        image.data().iter().any(|&b| b != 0)
+    }
+
+    #[test]
+    fn apply_tile_skips_degenerate_intersections() {
+        // The tile at (0, 1) touches the first and third rectangles only along an edge; their
+        // intersection with the tile is a zero-sized rectangle that must be skipped.
+        let image = apply_tile_in_region(
+            &[
+                rfx_rect(0, 0, 32, 64),
+                rfx_rect(0, 64, 64, 10),
+                rfx_rect(64, 0, 64, 128),
+            ],
+            0,
+            1,
+        );
+
+        assert!(!is_painted(&image, 0, 63));
+        for y in 64..=73 {
+            assert!(is_painted(&image, 0, y), "row {y} at x=0");
+            assert!(is_painted(&image, 63, y), "row {y} at x=63");
+        }
+        assert!(!is_painted(&image, 0, 74));
+        assert!(!is_painted(&image, 63, 74));
+    }
+
+    #[test]
+    fn region_outside_the_surface_paints_nothing_and_reports_empty() {
+        let image_size = IMAGE_SIZE;
+        let destination = InclusiveRectangle {
+            left: 0,
+            top: 0,
+            right: image_size - 1,
+            bottom: image_size - 1,
+        };
+        let clipping = clipping_rectangles(&[rfx_rect(130, 0, 8, 8)], &destination, image_size, image_size);
+        let tile = Tile {
+            y_quant_index: 0,
+            cb_quant_index: 0,
+            cr_quant_index: 0,
+            x: 1,
+            y: 0,
+            y_data: &[],
+            cb_data: &[],
+            cr_data: &[],
+        };
+        let update_rectangle = tiles_to_rectangles(&[tile], &destination)
+            .next()
+            .expect("one tile yields one rectangle");
+        let mut image = DecodedImage::new(PixelFormat::RgbA32, image_size, image_size);
+        let tile_output = vec![0xAB; usize::from(TILE_SIZE) * usize::from(TILE_SIZE) * 4];
+
+        let reported = image
+            .apply_tile(&tile_output, PixelFormat::RgbA32, &clipping, &update_rectangle)
+            .expect("tile applies");
+
+        assert!(!any_painted(&image));
+        assert_eq!(reported, InclusiveRectangle::empty());
+    }
+
+    fn decode_empty_tile_frame(rectangles: Vec<RfxRectangle>) -> InclusiveRectangle {
+        let blocks = [
+            rfx::Block::CodecChannel(rfx::CodecChannel::Region(rfx::RegionPdu { rectangles })),
+            rfx::Block::CodecChannel(rfx::CodecChannel::TileSet(rfx::TileSetPdu {
+                entropy_algorithm: EntropyAlgorithm::Rlgr1,
+                quants: Vec::new(),
+                tiles: Vec::new(),
+            })),
+            rfx::Block::CodecChannel(rfx::CodecChannel::FrameEnd(rfx::FrameEndPdu)),
+        ];
+        let mut bytes = Vec::new();
+        for block in &blocks {
+            bytes.extend(ironrdp_pdu::encode_vec(block).expect("block encodes"));
+        }
+
+        let mut context = DecodingContext::new();
+        context.channels = rfx::ChannelsPdu(vec![rfx::RfxChannel {
+            width: i16::try_from(IMAGE_SIZE).expect("fits"),
+            height: i16::try_from(IMAGE_SIZE).expect("fits"),
+        }]);
+        let mut image = DecodedImage::new(PixelFormat::RgbA32, IMAGE_SIZE, IMAGE_SIZE);
+        let destination = InclusiveRectangle {
+            left: 0,
+            top: 0,
+            right: IMAGE_SIZE - 1,
+            bottom: IMAGE_SIZE - 1,
+        };
+        let frame_begin = rfx::FrameBeginPdu {
+            index: 7,
+            number_of_regions: 1,
+        };
+
+        let (frame_id, reported) = context
+            .process_frame(frame_begin, &mut ReadCursor::new(&bytes), &mut image, &destination)
+            .expect("frame decodes");
+        assert_eq!(frame_id, 7);
+        reported
+    }
+
+    #[test]
+    fn frame_reports_inclusive_extents_at_the_surface_edge() {
+        let reported = decode_empty_tile_frame(vec![rfx_rect(100, 90, 28, 38)]);
+
+        assert_eq!(
+            reported,
+            InclusiveRectangle {
+                left: 100,
+                top: 90,
+                right: IMAGE_SIZE - 1,
+                bottom: IMAGE_SIZE - 1,
+            }
+        );
+    }
+
+    #[test]
+    fn frame_with_region_outside_the_surface_reports_empty() {
+        assert_eq!(
+            decode_empty_tile_frame(vec![rfx_rect(130, 0, 8, 8)]),
+            InclusiveRectangle::empty()
+        );
+    }
 }
