@@ -1546,6 +1546,9 @@ impl ProgressiveDecoder {
                 }
             }
 
+            // `Region` is a port of FreeRDP's region16 and works on exclusive bounds
+            // (right/bottom one past the last pixel) despite the `InclusiveRectangle`
+            // type. Feeding inclusive bounds drops one-row rectangles that touch a band.
             let mut clipping_region = Region::new();
             for rectangle in &region.rects {
                 let left = rectangle.x.min(surface_width);
@@ -1560,8 +1563,8 @@ impl ProgressiveDecoder {
                     clipping_region.union_rectangle(InclusiveRectangle {
                         left,
                         top,
-                        right: right - 1,
-                        bottom: bottom - 1,
+                        right,
+                        bottom,
                     });
                 }
             }
@@ -1585,16 +1588,17 @@ impl ProgressiveDecoder {
                     .intersect_rectangle(&InclusiveRectangle {
                         left,
                         top,
-                        right: right - 1,
-                        bottom: bottom - 1,
+                        right,
+                        bottom,
                     })
                     .rectangles
                     .into_iter()
+                    .filter(|rectangle| rectangle.left < rectangle.right && rectangle.top < rectangle.bottom)
                     .map(|rectangle| ExclusiveRectangle {
                         left: rectangle.left,
                         top: rectangle.top,
-                        right: rectangle.right + 1,
-                        bottom: rectangle.bottom + 1,
+                        right: rectangle.right,
+                        bottom: rectangle.bottom,
                     })
                     .collect::<Vec<_>>();
                 if update_rectangles.is_empty() {
@@ -5003,6 +5007,34 @@ mod tests {
             }]
         );
         assert_eq!(tile.pixels, expected_pixels);
+    }
+
+    #[test]
+    fn region_keeps_one_row_rect_adjacent_to_a_band() {
+        let data = fixture_component(0, 0, 0);
+
+        let mut decoder = ProgressiveDecoder::new();
+        decoder.begin_frame();
+        let tiles = decode_shared_payload(
+            &mut decoder,
+            1,
+            SHARED_WIDTH,
+            true,
+            vec![rect(32, 40, 32, 18), rect(0, 58, 16, 1), rect(32, 58, 32, 1)],
+            vec![first_tile(0, 0, 0, &data)],
+        );
+        decoder.end_frame();
+
+        assert_eq!(tiles.len(), 1);
+        let covered_rows: Vec<u16> = (0..SHARED_HEIGHT)
+            .filter(|&row| {
+                tiles[0]
+                    .update_rectangles
+                    .iter()
+                    .any(|r| r.top <= row && row < r.bottom && r.left <= 32 && 64 <= r.right)
+            })
+            .collect();
+        assert_eq!(covered_rows, (40..59).collect::<Vec<u16>>());
     }
 
     #[test]
