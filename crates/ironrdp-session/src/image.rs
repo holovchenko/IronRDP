@@ -530,6 +530,11 @@ impl DecodedImage {
     // To apply the buffer, we need to un-apply previously drawn cursor, and then apply it again
     // in other position.
 
+    /// Applies a decoded tile clipped to `clipping_rectangles`.
+    ///
+    /// `Region` is a port of FreeRDP's region16 and works on exclusive bounds (right/bottom one
+    /// past the last pixel) despite the `InclusiveRectangle` type, so both `clipping_rectangles`
+    /// and `update_rectangle` must carry exclusive bounds.
     pub(crate) fn apply_tile(
         &mut self,
         tile_output: &[u8],
@@ -539,18 +544,28 @@ impl DecodedImage {
     ) -> SessionResult<InclusiveRectangle> {
         trace!("Tile: {:?}", update_rectangle);
 
-        if !self.rect_fits(&clipping_rectangles.extents) {
+        if clipping_rectangles.rectangles.is_empty() {
+            return Ok(InclusiveRectangle::empty());
+        }
+
+        let clipping_extents = exclusive_to_inclusive(&clipping_rectangles.extents);
+        if !self.rect_fits(&clipping_extents) {
             debug!(
                 "Skipping tile update {:?} outside image bounds {}x{}",
-                clipping_rectangles.extents, self.width, self.height,
+                clipping_extents, self.width, self.height,
             );
             return Ok(InclusiveRectangle::empty());
         }
 
-        let pointer_rendering_state = self.pointer_rendering_begin(&clipping_rectangles.extents)?;
+        let pointer_rendering_state = self.pointer_rendering_begin(&clipping_extents)?;
 
         let update_region = clipping_rectangles.intersect_rectangle(update_rectangle);
-        for region_rectangle in &update_region.rectangles {
+        for region_rectangle in update_region
+            .rectangles
+            .iter()
+            .filter(|r| r.left < r.right && r.top < r.bottom)
+        {
+            let region_rectangle = exclusive_to_inclusive(region_rectangle);
             let source_x = region_rectangle.left - update_rectangle.left;
             let source_y = region_rectangle.top - update_rectangle.top;
             let stride = u16::from(pixel_format.bytes_per_pixel()) * TILE_SIZE;
@@ -567,7 +582,7 @@ impl DecodedImage {
             };
 
             let mut destination_image_region = ImageRegionMut {
-                region: region_rectangle.clone(),
+                region: region_rectangle,
                 step: self.width() * u16::from(self.pixel_format.bytes_per_pixel()),
                 pixel_format: self.pixel_format,
                 data: &mut self.data,
@@ -1035,6 +1050,16 @@ impl DecodedImage {
         let update_rectangle = self.pointer_rendering_end(pointer_rendering_state)?;
 
         Ok(update_rectangle)
+    }
+}
+
+/// Converts a non-degenerate rectangle with exclusive right/bottom into inclusive bounds.
+pub(crate) fn exclusive_to_inclusive(rectangle: &InclusiveRectangle) -> InclusiveRectangle {
+    InclusiveRectangle {
+        left: rectangle.left,
+        top: rectangle.top,
+        right: rectangle.right - 1,
+        bottom: rectangle.bottom - 1,
     }
 }
 

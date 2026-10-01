@@ -9,7 +9,7 @@ use ironrdp_pdu::geometry::{InclusiveRectangle, Rectangle as _};
 use ironrdp_pdu::{Decode as _, ReadCursor, decode_cursor};
 use tracing::{instrument, trace};
 
-use crate::image::DecodedImage;
+use crate::image::{DecodedImage, exclusive_to_inclusive};
 use crate::{SessionResult, custom_err, general_err, reason_err};
 
 const TILE_SIZE: u16 = 64;
@@ -151,7 +151,11 @@ impl DecodingContext {
         let clipping_rectangles = clipping_rectangles(region.rectangles.as_slice(), destination, width, height);
         trace!("Clipping rectangles: {:?}", clipping_rectangles);
 
-        let mut final_update_rectangle = clipping_rectangles.extents.clone();
+        let mut final_update_rectangle = if clipping_rectangles.rectangles.is_empty() {
+            InclusiveRectangle::empty()
+        } else {
+            exclusive_to_inclusive(&clipping_rectangles.extents)
+        };
 
         for (update_rectangle, tile_data) in tiles_to_rectangles(tile_set.tiles.as_slice(), destination)
             .zip(map_tiles_data(tile_set.tiles.as_slice(), tile_set.quants.as_slice()))
@@ -233,6 +237,10 @@ fn decode_component(
     Ok(())
 }
 
+/// Builds the clipping region with exclusive right/bottom bounds, as FreeRDP does
+/// (`region16_union_rect` with `right = x + width`). `Region` ports region16 and works on
+/// exclusive bounds despite the `InclusiveRectangle` type; inclusive bounds drop one-row
+/// rectangles that touch a band.
 fn clipping_rectangles(
     rectangles: &[RfxRectangle],
     destination: &InclusiveRectangle,
@@ -241,19 +249,22 @@ fn clipping_rectangles(
 ) -> Region {
     let mut clipping_rectangles = Region::new();
 
-    rectangles
-        .iter()
-        .map(|r| InclusiveRectangle {
-            left: min(destination.left + r.x, width - 1),
-            top: min(destination.top + r.y, height - 1),
-            right: min(destination.left + r.x + r.width - 1, width - 1),
-            bottom: min(destination.top + r.y + r.height - 1, height - 1),
-        })
-        .for_each(|r| clipping_rectangles.union_rectangle(r));
+    for r in rectangles {
+        let clipped = InclusiveRectangle {
+            left: min(destination.left + r.x, width),
+            top: min(destination.top + r.y, height),
+            right: min(destination.left + r.x + r.width, width),
+            bottom: min(destination.top + r.y + r.height, height),
+        };
+        if clipped.left < clipped.right && clipped.top < clipped.bottom {
+            clipping_rectangles.union_rectangle(clipped);
+        }
+    }
 
     clipping_rectangles
 }
 
+/// Tile rectangles with exclusive right/bottom bounds (`x + 64`), matching the clipping region.
 fn tiles_to_rectangles<'a>(
     tiles: &'a [Tile<'_>],
     destination: &'a InclusiveRectangle,
@@ -261,8 +272,8 @@ fn tiles_to_rectangles<'a>(
     tiles.iter().map(|t| InclusiveRectangle {
         left: destination.left + t.x * TILE_SIZE,
         top: destination.top + t.y * TILE_SIZE,
-        right: destination.left + t.x * TILE_SIZE + TILE_SIZE - 1,
-        bottom: destination.top + t.y * TILE_SIZE + TILE_SIZE - 1,
+        right: destination.left + t.x * TILE_SIZE + TILE_SIZE,
+        bottom: destination.top + t.y * TILE_SIZE + TILE_SIZE,
     })
 }
 
@@ -283,4 +294,85 @@ fn map_tiles_data<'a>(tiles: &[Tile<'a>], quants: &[Quant]) -> Vec<TileData<'a>>
 struct TileData<'a> {
     quants: [Quant; 3],
     data: [&'a [u8]; 3],
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const IMAGE_SIZE: u16 = 128;
+
+    fn rfx_rect(x: u16, y: u16, width: u16, height: u16) -> RfxRectangle {
+        RfxRectangle { x, y, width, height }
+    }
+
+    /// Applies one fully opaque tile at tile coordinates `(tile_x, tile_y)` through the region clipping and
+    /// returns the image, whose touched pixels are the non-zero ones.
+    fn apply_tile_in_region(rectangles: &[RfxRectangle], tile_x: u16, tile_y: u16) -> DecodedImage {
+        let destination = InclusiveRectangle {
+            left: 0,
+            top: 0,
+            right: IMAGE_SIZE - 1,
+            bottom: IMAGE_SIZE - 1,
+        };
+        let clipping = clipping_rectangles(rectangles, &destination, IMAGE_SIZE, IMAGE_SIZE);
+        let tile = Tile {
+            y_quant_index: 0,
+            cb_quant_index: 0,
+            cr_quant_index: 0,
+            x: tile_x,
+            y: tile_y,
+            y_data: &[],
+            cb_data: &[],
+            cr_data: &[],
+        };
+        let update_rectangle = tiles_to_rectangles(&[tile], &destination)
+            .next()
+            .expect("one tile yields one rectangle");
+
+        let mut image = DecodedImage::new(PixelFormat::RgbA32, IMAGE_SIZE, IMAGE_SIZE);
+        let tile_output = vec![0xAB; usize::from(TILE_SIZE) * usize::from(TILE_SIZE) * 4];
+        image
+            .apply_tile(&tile_output, PixelFormat::RgbA32, &clipping, &update_rectangle)
+            .expect("tile applies");
+        image
+    }
+
+    fn is_painted(image: &DecodedImage, x: usize, y: usize) -> bool {
+        image.data()[(y * usize::from(image.width()) + x) * 4] != 0
+    }
+
+    #[test]
+    fn region_keeps_one_row_rect_adjacent_to_a_band() {
+        let image = apply_tile_in_region(
+            &[
+                rfx_rect(32, 40, 32, 18),
+                rfx_rect(0, 58, 16, 1),
+                rfx_rect(32, 58, 32, 1),
+            ],
+            0,
+            0,
+        );
+
+        let painted_rows: Vec<usize> = (0..usize::from(IMAGE_SIZE))
+            .filter(|&y| is_painted(&image, 32, y) && is_painted(&image, 63, y))
+            .collect();
+        assert_eq!(painted_rows, (40..59).collect::<Vec<usize>>());
+        assert!(is_painted(&image, 0, 58));
+        assert!(is_painted(&image, 15, 58));
+        assert!(!is_painted(&image, 16, 58));
+        assert!(!is_painted(&image, 31, 58));
+        assert!(!is_painted(&image, 32, 59));
+        assert!(!is_painted(&image, 64, 58));
+    }
+
+    #[test]
+    fn region_clips_rect_extending_past_the_surface() {
+        let image = apply_tile_in_region(&[rfx_rect(120, 120, 64, 64)], 1, 1);
+
+        assert!(is_painted(&image, 120, 120));
+        assert!(is_painted(&image, 127, 127));
+        assert!(!is_painted(&image, 119, 120));
+        assert!(!is_painted(&image, 120, 119));
+    }
 }
