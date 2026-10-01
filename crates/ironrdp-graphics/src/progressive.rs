@@ -20,12 +20,12 @@
 //! - [`rgba_to_ycbcr`]: ITU-R BT.601 color space conversion
 //!
 //! ## State management
-//! - [`TileState`]: per-codec-context tile coefficient and DAS sign storage
+//! - [`TileState`]: per-tile coefficient and DAS sign storage
 //!   (~37 KB per tile)
 //! - [`SurfaceTiles`]: lazily-allocated tile grid for a surface
-//! - [`ProgressiveDecoder`]: high-level decoder maintaining per-context
-//!   progressive state and surface-scoped sub-band references, wired into the
-//!   EGFX `WireToSurface2Pdu` path
+//! - [`ProgressiveDecoder`]: high-level decoder maintaining per-surface tile
+//!   grids and sub-band references, wired into the EGFX `WireToSurface2Pdu`
+//!   path
 //!
 //! # Progressive quantization
 //!
@@ -1107,7 +1107,7 @@ impl Default for TileState {
 
 /// Grid of progressive tiles for a single surface.
 ///
-/// Manages tile state for a surface identified by its codec context ID.
+/// Manages tile state for a surface, shared by all of its codec contexts.
 /// Tiles are lazily allocated on first access to avoid upfront memory
 /// cost for surfaces that only partially receive progressive updates.
 pub struct SurfaceTiles {
@@ -1115,7 +1115,7 @@ pub struct SurfaceTiles {
     pub tiles_wide: u16,
     /// Height of the surface in tiles.
     pub tiles_high: u16,
-    /// Whether the associated context uses reduce-extrapolate DWT.
+    /// Whether the surface's most recent payload used reduce-extrapolate DWT.
     pub use_reduce_extrapolate: bool,
     /// Tile storage, indexed by `y_idx * tiles_wide + x_idx`.
     /// `None` entries haven't received any progressive data yet.
@@ -1180,7 +1180,7 @@ impl SurfaceTiles {
         }
     }
 
-    /// Reset all tiles (e.g., on context reset or surface resize).
+    /// Reset all tiles (e.g., on decoder reset or surface resize).
     pub fn reset(&mut self) {
         for tile in &mut self.tiles {
             *tile = None;
@@ -1310,14 +1310,17 @@ fn charge_region_clipping_work(used: &mut usize, units: usize) -> Result<(), Pro
 }
 
 /// Per-context progressive state, identified by `(surface_id, codec_context_id)`.
+///
+/// Tile state is not kept here: it belongs to the surface and is shared by all of its codec
+/// contexts. A context only remembers the band layout its CONTEXT block signalled.
 struct ProgressiveContext {
-    surface: SurfaceTiles,
+    use_reduce_extrapolate: bool,
 }
 
 /// High-level progressive bitmap decoder for EGFX WireToSurface2 processing.
 ///
-/// Maintains per-context progressive state and surface-scoped sub-band
-/// references across frames.
+/// Tile grids and sub-band references are kept per surface; a codec context only
+/// remembers its band-layout flag.
 /// MS-RDPEGFX section 3.3.1.1 associates each codec context with a surface, so
 /// two surfaces can reuse a codec context ID without sharing progressive state.
 /// Feed it progressive bitmap data from `WireToSurface2Pdu.bitmap_data` and get
@@ -1346,8 +1349,9 @@ struct ProgressiveContext {
 /// ```
 pub struct ProgressiveDecoder {
     contexts: BTreeMap<(u16, u32), ProgressiveContext>,
+    surfaces: BTreeMap<u16, SurfaceTiles>,
     references: BTreeMap<SubBandDiffingTileKey, DecDwtQ>,
-    frame_tiles: BTreeMap<(u16, u32), BTreeSet<(u16, u16)>>,
+    frame_tiles: BTreeMap<u16, BTreeSet<(u16, u16)>>,
     frame_active: bool,
     surface_context_flags: BTreeMap<u16, bool>,
     /// Smallest REGION (in tiles) decoded on the thread pool; smaller ones decode inline.
@@ -1359,6 +1363,7 @@ impl ProgressiveDecoder {
     pub fn new() -> Self {
         Self {
             contexts: BTreeMap::new(),
+            surfaces: BTreeMap::new(),
             references: BTreeMap::new(),
             frame_tiles: BTreeMap::new(),
             frame_active: false,
@@ -1413,7 +1418,7 @@ impl ProgressiveDecoder {
         // `MissingBlock("CONTEXT")`, freezing the image on the coarse first
         // pass.
         //
-        // Fall back to the value stored when the context was first created, then to the last
+        // Fall back to the value stored when the context was last decoded, then to the last
         // one this surface described: Windows opens a new codec context id mid-session,
         // deletes the previous one, and never repeats SYNC + CONTEXT, so a per-context lookup
         // alone rejects the new context. The retained value is scoped to its surface and
@@ -1429,7 +1434,7 @@ impl ProgressiveDecoder {
             .or_else(|| {
                 self.contexts
                     .get(&(surface_id, codec_context_id))
-                    .map(|c| c.surface.use_reduce_extrapolate)
+                    .map(|c| c.use_reduce_extrapolate)
             })
             .or_else(|| self.surface_context_flags.get(&surface_id).copied())
             .ok_or(ProgressiveDecodeError::MissingBlock("CONTEXT"))?;
@@ -1440,29 +1445,38 @@ impl ProgressiveDecoder {
             self.frame_tiles.clear();
         }
 
-        let (contexts, references, all_frame_tiles) = (&mut self.contexts, &mut self.references, &mut self.frame_tiles);
+        let (contexts, surfaces, references, all_frame_tiles) = (
+            &mut self.contexts,
+            &mut self.surfaces,
+            &mut self.references,
+            &mut self.frame_tiles,
+        );
         let parallel_min_tiles = self.parallel_min_tiles;
 
-        // Get or create the context for this (surface_id, codec_context_id).
-        let context = match contexts.entry((surface_id, codec_context_id)) {
+        // Get or create the tile grid of this surface, shared by all of its codec contexts.
+        let surface = match surfaces.entry(surface_id) {
             Entry::Occupied(e) => e.into_mut(),
-            Entry::Vacant(e) => {
-                let surface = SurfaceTiles::new(surface_width, surface_height, use_reduce_extrapolate)?;
-                e.insert(ProgressiveContext { surface })
-            }
+            Entry::Vacant(e) => e.insert(SurfaceTiles::new(
+                surface_width,
+                surface_height,
+                use_reduce_extrapolate,
+            )?),
         };
 
-        // If surface dimensions changed, reallocate the codec-context tile grid.
+        // If surface dimensions changed, reallocate the surface tile grid.
         let expected_wide = surface_width.div_ceil(TILE_DIM);
         let expected_high = surface_height.div_ceil(TILE_DIM);
-        let surface_resized =
-            context.surface.tiles_wide != expected_wide || context.surface.tiles_high != expected_high;
+        let surface_resized = surface.tiles_wide != expected_wide || surface.tiles_high != expected_high;
         if surface_resized {
-            context.surface = SurfaceTiles::new(surface_width, surface_height, use_reduce_extrapolate)?;
+            *surface = SurfaceTiles::new(surface_width, surface_height, use_reduce_extrapolate)?;
         }
-        context.surface.use_reduce_extrapolate = use_reduce_extrapolate;
+        surface.use_reduce_extrapolate = use_reduce_extrapolate;
+        contexts.insert(
+            (surface_id, codec_context_id),
+            ProgressiveContext { use_reduce_extrapolate },
+        );
 
-        let frame_tiles = all_frame_tiles.entry((surface_id, codec_context_id)).or_default();
+        let frame_tiles = all_frame_tiles.entry(surface_id).or_default();
         if surface_resized {
             frame_tiles.clear();
         }
@@ -1509,14 +1523,14 @@ impl ProgressiveDecoder {
                 parallel_min_tiles,
                 !has_repeated_tile(&region.tiles),
             )
-            .map(|pool| decode_region_tiles(pool, &params, &context.surface, references, &region.tiles));
+            .map(|pool| decode_region_tiles(pool, &params, surface, references, &region.tiles));
             #[cfg(not(feature = "parallel"))]
             let batched_outcomes: Option<Vec<Result<TileOutput, ProgressiveDecodeError>>> = None;
 
             if let Some(outcomes) = batched_outcomes {
                 for (tile_block, outcome) in region.tiles.iter().zip(outcomes) {
                     commit_tile(
-                        &mut context.surface,
+                        surface,
                         references,
                         surface_id,
                         tile_key(tile_block),
@@ -1527,9 +1541,9 @@ impl ProgressiveDecoder {
                 }
             } else {
                 for tile_block in &region.tiles {
-                    let outcome = decode_tile(&params, &context.surface, references, tile_block);
+                    let outcome = decode_tile(&params, surface, references, tile_block);
                     commit_tile(
-                        &mut context.surface,
+                        surface,
                         references,
                         surface_id,
                         tile_key(tile_block),
@@ -1598,7 +1612,7 @@ impl ProgressiveDecoder {
                 if let Some(mut tile) = region_tiles.remove(&(x_idx, y_idx)) {
                     tile.update_rectangles = update_rectangles;
                     decoded_tiles.push(tile);
-                } else if context.surface.get(x_idx, y_idx).is_some() {
+                } else if surface.get(x_idx, y_idx).is_some() {
                     repaint.push(decoded_tiles.len());
                     decoded_tiles.push(DecodedTile {
                         x_idx,
@@ -1608,7 +1622,7 @@ impl ProgressiveDecoder {
                     });
                 }
             }
-            reconstruct_repaints(&context.surface, &mut decoded_tiles, &repaint, parallel_min_tiles);
+            reconstruct_repaints(surface, &mut decoded_tiles, &repaint, parallel_min_tiles);
         }
 
         if !self.frame_active {
@@ -1618,32 +1632,39 @@ impl ProgressiveDecoder {
         Ok(decoded_tiles)
     }
 
-    /// Delete a codec context, freeing its progressive tile state.
+    /// Delete a codec context, freeing its band-layout memory.
     ///
     /// Called when the server sends RDPGFX_DELETE_ENCODING_CONTEXT, which
     /// identifies both the surface and codec context.
+    ///
+    /// Tile state belongs to the surface, not the context: a REGION of one codec
+    /// context clips tiles another context decoded in the same frame (Windows
+    /// servers rely on this), so deleting a context keeps them, as FreeRDP's
+    /// no-op DeleteEncodingContext handler does. [`Self::delete_surface`]
+    /// releases them.
     pub fn delete_context(&mut self, surface_id: u16, codec_context_id: u32) {
         self.contexts.remove(&(surface_id, codec_context_id));
-        self.frame_tiles.remove(&(surface_id, codec_context_id));
     }
 
-    /// Delete every codec context associated with a surface.
+    /// Delete a surface's tile grid and every codec context associated with it.
     ///
     /// Call this when discarding a surface so a subsequent surface with the
     /// same ID cannot inherit stale Progressive tile state.
     pub fn delete_surface(&mut self, surface_id: u16) {
+        self.surfaces.remove(&surface_id);
         self.contexts
             .retain(|(context_surface_id, _), _| *context_surface_id != surface_id);
         self.references
             .retain(|(reference_surface_id, _, _), _| *reference_surface_id != surface_id);
-        self.frame_tiles
-            .retain(|(context_surface_id, _), _| *context_surface_id != surface_id);
+        self.frame_tiles.remove(&surface_id);
         self.surface_context_flags.remove(&surface_id);
     }
 
-    /// Reset codec-context state while retaining surface sub-band references.
+    /// Reset codec-context and surface tile state while retaining sub-band references
+    /// and the per-surface band-layout flags.
     pub fn reset(&mut self) {
         self.contexts.clear();
+        self.surfaces.clear();
         self.frame_tiles.clear();
         self.frame_active = false;
     }
@@ -2480,6 +2501,7 @@ mod tests {
 
         decoder.reset();
         assert!(decoder.contexts.is_empty());
+        assert!(decoder.surfaces.is_empty());
         assert_eq!(decoder.references.get(&(1, 0, 0)), Some(&reference));
 
         assert!(
@@ -2504,10 +2526,13 @@ mod tests {
         assert!(decoder.decode_bitmap(1, 0, 640, 480, &stream).is_ok());
         assert!(decoder.decode_bitmap(2, 0, 800, 600, &stream).is_ok());
         assert_eq!(decoder.contexts.len(), 2);
+        assert_eq!(decoder.surfaces.len(), 2);
 
         decoder.delete_context(1, 0);
         assert_eq!(decoder.contexts.len(), 1);
         assert!(decoder.contexts.contains_key(&(2, 0)));
+        assert!(decoder.surfaces.contains_key(&1));
+        assert!(decoder.surfaces.contains_key(&2));
 
         assert!(decoder.decode_bitmap(1, 0, 640, 480, &stream).is_ok());
         assert!(decoder.decode_bitmap(1, 1, 640, 480, &stream).is_ok());
@@ -2516,6 +2541,8 @@ mod tests {
         decoder.delete_surface(1);
         assert_eq!(decoder.contexts.len(), 1);
         assert!(decoder.contexts.contains_key(&(2, 0)));
+        assert_eq!(decoder.surfaces.len(), 1);
+        assert!(decoder.surfaces.contains_key(&2));
     }
 
     #[test]
@@ -2598,7 +2625,7 @@ mod tests {
         let frame_tiles = (0..11_000u16).map(|index| (index % 128, index / 128)).collect();
         let mut decoder = ProgressiveDecoder::new();
         decoder.begin_frame();
-        decoder.frame_tiles.insert((1, 1), frame_tiles);
+        decoder.frame_tiles.insert(1, frame_tiles);
         let error = match decoder.decode_bitmap(1, 1, 8192, 8192, &stream_with_rects(rects)) {
             Err(error) => error,
             Ok(_) => panic!("tile intersections must share the clipping work budget"),
@@ -3810,8 +3837,8 @@ mod tests {
                 }
             }
         }
-        if let Some(context) = decoder.contexts.get(&(FIXTURE_SURFACE, FIXTURE_CONTEXT)) {
-            for slot in &context.surface.tiles {
+        if let Some(surface) = decoder.surfaces.get(&FIXTURE_SURFACE) {
+            for slot in &surface.tiles {
                 fnv(hash, &[u8::from(slot.is_some())]);
                 if let Some(state) = slot {
                     // Every TileState field: two tiles that differ only in sign, prog_quant,
@@ -4396,9 +4423,9 @@ mod tests {
             .expect("original tile should produce an update")
             .pixels;
         let reference = decoder
-            .contexts
-            .get(&(1, 7))
-            .and_then(|context| context.surface.get(0, 0))
+            .surfaces
+            .get(&1)
+            .and_then(|surface| surface.get(0, 0))
             .expect("original tile state should be retained")
             .coefficients;
 
@@ -4406,9 +4433,9 @@ mod tests {
             .decode_bitmap(2, 8, 64, 64, &simple_tile_stream(0, other_surface_components, true))
             .expect("other surface tile should decode");
         let other_reference = decoder
-            .contexts
-            .get(&(2, 8))
-            .and_then(|context| context.surface.get(0, 0))
+            .surfaces
+            .get(&2)
+            .and_then(|surface| surface.get(0, 0))
             .expect("other surface tile state should be retained")
             .coefficients;
 
@@ -4429,9 +4456,9 @@ mod tests {
         assert_ne!(first_pixels, difference_pixels);
 
         let updated_tile = decoder
-            .contexts
-            .get(&(1, 7))
-            .and_then(|context| context.surface.get(0, 0))
+            .surfaces
+            .get(&1)
+            .and_then(|surface| surface.get(0, 0))
             .expect("difference tile state should be retained");
         assert!(updated_tile.is_difference);
         for ((updated_component, reference_component), delta_component) in updated_tile
@@ -4451,9 +4478,9 @@ mod tests {
 
         assert_eq!(
             decoder
-                .contexts
-                .get(&(2, 8))
-                .and_then(|context| context.surface.get(0, 0))
+                .surfaces
+                .get(&2)
+                .and_then(|surface| surface.get(0, 0))
                 .expect("other surface tile state should remain retained")
                 .coefficients,
             other_reference
@@ -4517,9 +4544,9 @@ mod tests {
         );
         assert!(
             decoder
-                .contexts
-                .get(&(1, 7))
-                .and_then(|context| context.surface.get(0, 0))
+                .surfaces
+                .get(&1)
+                .and_then(|surface| surface.get(0, 0))
                 .expect("difference tile state should be retained")
                 .is_difference
         );
@@ -4560,9 +4587,9 @@ mod tests {
         );
         assert!(
             !decoder
-                .contexts
-                .get(&(1, 7))
-                .and_then(|context| context.surface.get(0, 0))
+                .surfaces
+                .get(&1)
+                .and_then(|surface| surface.get(0, 0))
                 .expect("replacement tile state should be retained")
                 .is_difference
         );
@@ -4715,9 +4742,9 @@ mod tests {
             .expect("difference tile should decode with the surface reference");
         let expected_delta = decode_full_quality_components(difference_components);
         let updated = decoder
-            .contexts
-            .get(&(1, 8))
-            .and_then(|context| context.surface.get(0, 0))
+            .surfaces
+            .get(&1)
+            .and_then(|surface| surface.get(0, 0))
             .expect("difference tile state should be retained")
             .coefficients;
 
@@ -4910,5 +4937,150 @@ mod tests {
                 assert_eq!(*updated, retained.saturating_add(*delta));
             }
         }
+    }
+
+    const SHARED_WIDTH: u16 = 128;
+    const SHARED_HEIGHT: u16 = 64;
+
+    /// Pixels a lone decoder produces for the tile built from `data`.
+    fn fixture_tile_pixels(data: &[u8]) -> Vec<u8> {
+        let mut tiles = ProgressiveDecoder::new()
+            .decode_bitmap(
+                1,
+                1,
+                SHARED_WIDTH,
+                SHARED_HEIGHT,
+                &fixture_stream(
+                    true,
+                    vec![rect(0, 0, SHARED_WIDTH, SHARED_HEIGHT)],
+                    vec![first_tile(0, 0, 0, data)],
+                ),
+            )
+            .expect("reference decode");
+        assert_eq!(tiles.len(), 1, "reference decode");
+        tiles.remove(0).pixels
+    }
+
+    /// Decode one payload for surface 1 of `width` x `SHARED_HEIGHT`.
+    fn decode_shared_payload(
+        decoder: &mut ProgressiveDecoder,
+        codec_context_id: u32,
+        width: u16,
+        with_context: bool,
+        rects: Vec<ironrdp_pdu::codecs::rfx::RfxRectangle>,
+        tiles: Vec<ironrdp_pdu::codecs::rfx::progressive::ProgressiveTile<'_>>,
+    ) -> Vec<DecodedTile> {
+        decoder
+            .decode_bitmap(
+                1,
+                codec_context_id,
+                width,
+                SHARED_HEIGHT,
+                &fixture_stream(with_context, rects, tiles),
+            )
+            .expect("payload decodes")
+    }
+
+    #[test]
+    fn region_clips_tiles_decoded_by_another_codec_context_in_the_same_frame() {
+        let data = fixture_component(0, 0, 0);
+        let expected_pixels = fixture_tile_pixels(&data);
+
+        let mut decoder = ProgressiveDecoder::new();
+        decoder.begin_frame();
+        let first = decode_shared_payload(
+            &mut decoder,
+            1,
+            SHARED_WIDTH,
+            true,
+            vec![rect(64, 0, 64, 64)],
+            vec![first_tile(0, 0, 0, &data)],
+        );
+        assert!(first.is_empty());
+
+        let second = decode_shared_payload(
+            &mut decoder,
+            2,
+            SHARED_WIDTH,
+            true,
+            vec![rect(8, 0, 32, 64)],
+            Vec::new(),
+        );
+        decoder.end_frame();
+
+        assert_eq!(second.len(), 1);
+        let tile = &second[0];
+        assert_eq!((tile.x_idx, tile.y_idx), (0, 0));
+        assert_eq!(
+            tile.update_rectangles,
+            vec![ExclusiveRectangle {
+                left: 8,
+                top: 0,
+                right: 40,
+                bottom: 64,
+            }]
+        );
+        assert_eq!(tile.pixels, expected_pixels);
+    }
+
+    #[test]
+    fn deleting_a_codec_context_keeps_surface_tiles_for_other_contexts() {
+        let data = fixture_component(0, 0, 0);
+        let expected_pixels = fixture_tile_pixels(&data);
+
+        let mut decoder = ProgressiveDecoder::new();
+        decoder.begin_frame();
+        decode_shared_payload(
+            &mut decoder,
+            1,
+            SHARED_WIDTH,
+            true,
+            vec![rect(64, 0, 64, 64)],
+            vec![first_tile(0, 0, 0, &data)],
+        );
+        decoder.delete_context(1, 1);
+        assert!(!decoder.contexts.contains_key(&(1, 1)));
+
+        // The new context sends no CONTEXT block and falls back to the surface flag.
+        let second = decode_shared_payload(
+            &mut decoder,
+            2,
+            SHARED_WIDTH,
+            false,
+            vec![rect(8, 0, 32, 64)],
+            Vec::new(),
+        );
+        assert_eq!(second.len(), 1);
+        assert_eq!((second[0].x_idx, second[0].y_idx), (0, 0));
+        assert_eq!(second[0].pixels, expected_pixels);
+
+        assert!(decoder.surfaces.contains_key(&1));
+        decoder.delete_surface(1);
+        assert!(!decoder.surfaces.contains_key(&1));
+        assert!(!decoder.frame_tiles.contains_key(&1));
+        decoder.end_frame();
+    }
+
+    #[test]
+    fn resizing_a_surface_drops_its_frame_tiles() {
+        let data = fixture_component(0, 0, 0);
+
+        let mut decoder = ProgressiveDecoder::new();
+        decoder.begin_frame();
+        decode_shared_payload(
+            &mut decoder,
+            1,
+            SHARED_WIDTH,
+            true,
+            vec![rect(64, 0, 64, 64)],
+            vec![first_tile(0, 0, 0, &data)],
+        );
+        assert!(decoder.frame_tiles[&1].contains(&(0, 0)));
+
+        let resized = decode_shared_payload(&mut decoder, 1, 192, false, vec![rect(0, 0, 64, 64)], Vec::new());
+        assert!(decoder.frame_tiles[&1].is_empty());
+        decoder.end_frame();
+
+        assert!(resized.is_empty());
     }
 }
