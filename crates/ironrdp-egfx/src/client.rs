@@ -2992,9 +2992,21 @@ mod tests {
     }
 
     #[test]
-    fn progressive_context_is_deleted_with_encoding_context() {
+    fn deleting_an_encoding_context_keeps_the_surface_tiles_for_later_contexts() {
         let mut client = progressive_client();
-        wire_progressive(&mut client, progressive_context_stream(true)).unwrap();
+        start_frame(&mut client, 1);
+        client
+            .handle_pdu(GfxPdu::MapSurfaceToOutput(crate::pdu::MapSurfaceToOutputPdu {
+                surface_id: 1,
+                output_origin_x: 0,
+                output_origin_y: 0,
+            }))
+            .unwrap();
+        end_frame(&mut client, 1);
+        let _ = client.drain_output();
+
+        start_frame(&mut client, 2);
+        wire_progressive(&mut client, progressive_tile_stream(0, 0, 32, 32)).unwrap();
         client
             .handle_pdu(GfxPdu::DeleteEncodingContext(DeleteEncodingContextPdu {
                 surface_id: 1,
@@ -3002,10 +3014,35 @@ mod tests {
             }))
             .unwrap();
 
-        // The context's tiles are gone, but the surface survives and keeps the band layout it
-        // was given, so a payload reusing the id decodes from scratch. Windows deletes a codec
-        // context as it opens the next one and never repeats SYNC + CONTEXT.
-        assert!(wire_progressive(&mut client, progressive_context_stream(false)).is_ok());
+        // Windows deletes a codec context as it opens the next one and never repeats
+        // SYNC + CONTEXT. The surface keeps its tiles and band layout, so the new
+        // context's tile-less REGION still clips the tile the deleted context decoded.
+        client
+            .handle_pdu(GfxPdu::WireToSurface2(WireToSurface2Pdu {
+                surface_id: 1,
+                codec_id: crate::pdu::Codec2Type::RemoteFxProgressive,
+                codec_context_id: 8,
+                pixel_format: PixelFormat::XRgb,
+                bitmap_data: progressive_context_stream(false),
+            }))
+            .unwrap();
+        end_frame(&mut client, 2);
+
+        // The first payload alone yields a 32x32 update; the 64x64 one can only come from
+        // the later context clipping the surviving tile.
+        let output = client.drain_output();
+        let widest = output.last().expect("output after the second context");
+        assert_eq!(
+            widest.region,
+            ExclusiveRectangle {
+                left: 0,
+                top: 0,
+                right: 64,
+                bottom: 64,
+            }
+        );
+        assert_eq!(widest.data.len(), 64 * 64 * 4);
+        assert!(widest.data.iter().any(|&value| value != 0));
     }
 
     #[test]

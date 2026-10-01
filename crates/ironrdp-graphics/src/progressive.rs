@@ -895,7 +895,7 @@ pub struct TileState {
     pub is_difference: bool,
     /// Last progressive quality byte (0xFF = full quality).
     pub quality: u8,
-    /// Whether reduce-extrapolate DWT is used for this tile's context.
+    /// Whether the tile's first pass used the reduce-extrapolate band layout.
     pub use_reduce_extrapolate: bool,
 }
 
@@ -1180,13 +1180,6 @@ impl SurfaceTiles {
         }
     }
 
-    /// Reset all tiles (e.g., on decoder reset or surface resize).
-    pub fn reset(&mut self) {
-        for tile in &mut self.tiles {
-            *tile = None;
-        }
-    }
-
     fn tile_index(&self, x_idx: u16, y_idx: u16) -> Option<usize> {
         if x_idx >= self.tiles_wide || y_idx >= self.tiles_high {
             return None;
@@ -1309,7 +1302,7 @@ fn charge_region_clipping_work(used: &mut usize, units: usize) -> Result<(), Pro
     }
 }
 
-/// Per-context progressive state, identified by `(surface_id, codec_context_id)`.
+/// Per-codec-context progressive state, keyed by `(surface_id, codec_context_id)`.
 ///
 /// Tile state is not kept here: it belongs to the surface and is shared by all of its codec
 /// contexts. A context only remembers the band layout its CONTEXT block signalled.
@@ -1409,9 +1402,8 @@ impl ProgressiveDecoder {
 
         // Extract the band-layout flag from the CONTEXT block when present.
         // Per MS-RDPEGFX 2.2.4.2 the SYNC + CONTEXT blocks establish a codec
-        // context once (keyed by `(surface_id, codec_context_id)`) and are not
-        // required to be
-        // repeated on subsequent frames that reference the same context.
+        // context once and are not required to be repeated on subsequent frames
+        // that reference the same context.
         // Real-world servers (xrdp, GNOME Remote Desktop) omit the CONTEXT
         // block on every frame after the first one that established the
         // context. The strict requirement rejected each of those frames with
@@ -2461,16 +2453,6 @@ mod tests {
 
         // Out of bounds returns None
         assert!(surface.get_or_create(2, 2).is_none());
-    }
-
-    #[test]
-    fn surface_tiles_reset() {
-        let mut surface = SurfaceTiles::new(128, 128, false).unwrap();
-        surface.get_or_create(0, 0);
-        assert!(surface.get(0, 0).is_some());
-
-        surface.reset();
-        assert!(surface.get(0, 0).is_none());
     }
 
     #[test]
@@ -5021,6 +5003,68 @@ mod tests {
             }]
         );
         assert_eq!(tile.pixels, expected_pixels);
+    }
+
+    #[test]
+    fn upgrade_from_another_codec_context_matches_a_single_context() {
+        let data = fixture_component(0, 0, 0);
+        let raw = [0xA5u8; 8];
+        let whole = || vec![rect(0, 0, SHARED_WIDTH, SHARED_HEIGHT)];
+
+        let mut single = ProgressiveDecoder::new();
+        decode_shared_payload(
+            &mut single,
+            1,
+            SHARED_WIDTH,
+            true,
+            whole(),
+            vec![first_tile(0, 0, 0, &data)],
+        );
+        let expected = decode_shared_payload(
+            &mut single,
+            1,
+            SHARED_WIDTH,
+            false,
+            whole(),
+            vec![upgrade_tile(0, 0, &raw)],
+        );
+        assert_eq!(expected.len(), 1);
+
+        let mut split = ProgressiveDecoder::new();
+        decode_shared_payload(
+            &mut split,
+            1,
+            SHARED_WIDTH,
+            true,
+            whole(),
+            vec![first_tile(0, 0, 0, &data)],
+        );
+        let actual = decode_shared_payload(
+            &mut split,
+            2,
+            SHARED_WIDTH,
+            false,
+            whole(),
+            vec![upgrade_tile(0, 0, &raw)],
+        );
+        assert_eq!(actual.len(), 1);
+        assert_eq!(actual[0].pixels, expected[0].pixels);
+
+        let expected_state = single.surfaces[&1].get(0, 0).expect("single-context tile");
+        let actual_state = split.surfaces[&1].get(0, 0).expect("split-context tile");
+        assert_eq!(expected_state.pass, 2);
+        assert_eq!(actual_state.pass, expected_state.pass);
+        assert!(actual_state.coefficients == expected_state.coefficients);
+        assert!(actual_state.sign == expected_state.sign);
+        assert!(actual_state.prog_quant == expected_state.prog_quant);
+        assert_eq!(actual_state.quant_idx, expected_state.quant_idx);
+        assert!(actual_state.base_quant == expected_state.base_quant);
+        assert_eq!(actual_state.quality, expected_state.quality);
+        assert_eq!(actual_state.is_difference, expected_state.is_difference);
+        assert_eq!(
+            actual_state.use_reduce_extrapolate,
+            expected_state.use_reduce_extrapolate
+        );
     }
 
     #[test]
