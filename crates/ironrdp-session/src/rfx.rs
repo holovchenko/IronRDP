@@ -506,32 +506,64 @@ mod tests {
         );
     }
 
-    #[test]
-    fn tiles_to_rectangles_saturates_server_controlled_tile_index() {
-        let destination = InclusiveRectangle {
-            left: 0,
-            top: 0,
-            right: IMAGE_SIZE - 1,
-            bottom: IMAGE_SIZE - 1,
-        };
-        let tile = Tile {
+    fn tile_at(x: u16, y: u16) -> Tile<'static> {
+        Tile {
             y_quant_index: 0,
             cb_quant_index: 0,
             cr_quant_index: 0,
-            x: 1023,
-            y: 1023,
+            x,
+            y,
             y_data: &[],
             cb_data: &[],
             cr_data: &[],
-        };
+        }
+    }
 
-        let rectangle = tiles_to_rectangles(&[tile], &destination)
+    fn destination_at(left: u16, top: u16) -> InclusiveRectangle {
+        InclusiveRectangle {
+            left,
+            top,
+            right: IMAGE_SIZE - 1,
+            bottom: IMAGE_SIZE - 1,
+        }
+    }
+
+    fn first_tile_rectangle(tile: Tile<'static>, destination: &InclusiveRectangle) -> InclusiveRectangle {
+        tiles_to_rectangles(&[tile], destination)
             .next()
-            .expect("one tile yields one rectangle");
+            .expect("one tile yields one rectangle")
+    }
+
+    #[test]
+    fn tiles_to_rectangles_saturates_server_controlled_tile_index() {
+        let rectangle = first_tile_rectangle(tile_at(1023, 1023), &destination_at(0, 0));
 
         assert_eq!(rectangle.left, 1023 * TILE_SIZE);
         assert_eq!(rectangle.right, u16::MAX);
         assert_eq!(rectangle.bottom, u16::MAX);
+    }
+
+    #[test]
+    fn tiles_to_rectangles_saturates_tile_index_multiplication() {
+        for index in [1024, u16::MAX] {
+            let rectangle = first_tile_rectangle(tile_at(index, index), &destination_at(0, 0));
+
+            assert_eq!(rectangle.left, u16::MAX, "tile index {index}");
+            assert_eq!(rectangle.top, u16::MAX, "tile index {index}");
+            assert_eq!(rectangle.right, u16::MAX, "tile index {index}");
+            assert_eq!(rectangle.bottom, u16::MAX, "tile index {index}");
+        }
+    }
+
+    #[test]
+    fn tiles_to_rectangles_saturates_destination_offset() {
+        let rectangle = first_tile_rectangle(tile_at(1, 0), &destination_at(65500, 0));
+        assert_eq!(rectangle.left, u16::MAX);
+        assert_eq!(rectangle.top, 0);
+
+        let rectangle = first_tile_rectangle(tile_at(0, 1), &destination_at(0, 65500));
+        assert_eq!(rectangle.left, 0);
+        assert_eq!(rectangle.top, u16::MAX);
     }
 
     #[test]
@@ -554,5 +586,24 @@ mod tests {
         assert_eq!(region.extents.top, 100);
         assert_eq!(region.extents.right, IMAGE_SIZE);
         assert_eq!(region.extents.bottom, IMAGE_SIZE);
+    }
+
+    #[test]
+    fn clipping_rectangles_drops_rectangle_whose_offset_overflows() {
+        let region = clipping_rectangles(
+            &[rfx_rect(100, 0, 64, 64)],
+            &destination_at(65500, 0),
+            IMAGE_SIZE,
+            IMAGE_SIZE,
+        );
+        assert_eq!(region.extents, InclusiveRectangle::empty());
+
+        let region = clipping_rectangles(
+            &[rfx_rect(0, 100, 64, 64)],
+            &destination_at(0, 65500),
+            IMAGE_SIZE,
+            IMAGE_SIZE,
+        );
+        assert_eq!(region.extents, InclusiveRectangle::empty());
     }
 }
