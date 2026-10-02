@@ -1055,6 +1055,7 @@ impl DecodedImage {
 
 /// Converts a non-degenerate rectangle with exclusive right/bottom into inclusive bounds.
 pub(crate) fn exclusive_to_inclusive(rectangle: &InclusiveRectangle) -> InclusiveRectangle {
+    debug_assert!(rectangle.left < rectangle.right && rectangle.top < rectangle.bottom);
     InclusiveRectangle {
         left: rectangle.left,
         top: rectangle.top,

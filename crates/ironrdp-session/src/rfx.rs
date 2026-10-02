@@ -250,11 +250,13 @@ fn clipping_rectangles(
     let mut clipping_rectangles = Region::new();
 
     for r in rectangles {
+        let left = destination.left.saturating_add(r.x);
+        let top = destination.top.saturating_add(r.y);
         let clipped = InclusiveRectangle {
-            left: min(destination.left + r.x, width),
-            top: min(destination.top + r.y, height),
-            right: min(destination.left + r.x + r.width, width),
-            bottom: min(destination.top + r.y + r.height, height),
+            left: min(left, width),
+            top: min(top, height),
+            right: min(left.saturating_add(r.width), width),
+            bottom: min(top.saturating_add(r.height), height),
         };
         if clipped.left < clipped.right && clipped.top < clipped.bottom {
             clipping_rectangles.union_rectangle(clipped);
@@ -265,15 +267,20 @@ fn clipping_rectangles(
 }
 
 /// Tile rectangles with exclusive right/bottom bounds (`x + 64`), matching the clipping region.
+/// Server-controlled tile indices saturate instead of overflowing.
 fn tiles_to_rectangles<'a>(
     tiles: &'a [Tile<'_>],
     destination: &'a InclusiveRectangle,
 ) -> impl Iterator<Item = InclusiveRectangle> + 'a {
-    tiles.iter().map(|t| InclusiveRectangle {
-        left: destination.left + t.x * TILE_SIZE,
-        top: destination.top + t.y * TILE_SIZE,
-        right: destination.left + t.x * TILE_SIZE + TILE_SIZE,
-        bottom: destination.top + t.y * TILE_SIZE + TILE_SIZE,
+    tiles.iter().map(|t| {
+        let left = destination.left.saturating_add(t.x.saturating_mul(TILE_SIZE));
+        let top = destination.top.saturating_add(t.y.saturating_mul(TILE_SIZE));
+        InclusiveRectangle {
+            left,
+            top,
+            right: left.saturating_add(TILE_SIZE),
+            bottom: top.saturating_add(TILE_SIZE),
+        }
     })
 }
 
@@ -497,5 +504,55 @@ mod tests {
             decode_empty_tile_frame(vec![rfx_rect(130, 0, 8, 8)]),
             InclusiveRectangle::empty()
         );
+    }
+
+    #[test]
+    fn tiles_to_rectangles_saturates_server_controlled_tile_index() {
+        let destination = InclusiveRectangle {
+            left: 0,
+            top: 0,
+            right: IMAGE_SIZE - 1,
+            bottom: IMAGE_SIZE - 1,
+        };
+        let tile = Tile {
+            y_quant_index: 0,
+            cb_quant_index: 0,
+            cr_quant_index: 0,
+            x: 1023,
+            y: 1023,
+            y_data: &[],
+            cb_data: &[],
+            cr_data: &[],
+        };
+
+        let rectangle = tiles_to_rectangles(&[tile], &destination)
+            .next()
+            .expect("one tile yields one rectangle");
+
+        assert_eq!(rectangle.left, 1023 * TILE_SIZE);
+        assert_eq!(rectangle.right, u16::MAX);
+        assert_eq!(rectangle.bottom, u16::MAX);
+    }
+
+    #[test]
+    fn clipping_rectangles_clamps_overflowing_rectangle_instead_of_dropping_it() {
+        let destination = InclusiveRectangle {
+            left: 100,
+            top: 100,
+            right: IMAGE_SIZE - 1,
+            bottom: IMAGE_SIZE - 1,
+        };
+
+        let region = clipping_rectangles(
+            &[rfx_rect(0, 0, u16::MAX, u16::MAX)],
+            &destination,
+            IMAGE_SIZE,
+            IMAGE_SIZE,
+        );
+
+        assert_eq!(region.extents.left, 100);
+        assert_eq!(region.extents.top, 100);
+        assert_eq!(region.extents.right, IMAGE_SIZE);
+        assert_eq!(region.extents.bottom, IMAGE_SIZE);
     }
 }
