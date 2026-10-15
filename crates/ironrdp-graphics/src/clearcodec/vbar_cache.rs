@@ -41,6 +41,9 @@ pub struct VBarCache {
     vbar_cursor: u16,
     /// Current write cursor for short V-bar storage (wraps at 16383).
     short_vbar_cursor: u16,
+    /// Set by [`Self::clear`]: the client cursors no longer track the server's, so cache
+    /// hits fail and misses are not stored until [`Self::reset`] rewinds both sides.
+    poisoned: bool,
 }
 
 impl VBarCache {
@@ -56,22 +59,28 @@ impl VBarCache {
             short_vbar_storage,
             vbar_cursor: 0,
             short_vbar_cursor: 0,
+            poisoned: false,
         }
     }
 
     /// Reset both caches (when FLAG_CACHE_RESET is received).
+    ///
+    /// The cursors rewind to 0 on both sides, so this also ends the poisoned state.
     pub fn reset(&mut self) {
+        self.poisoned = false;
         self.vbar_cursor = 0;
         self.short_vbar_cursor = 0;
         // Per spec, only cursors reset. Existing entries become stale
         // but the cursor reset means new entries overwrite from index 0.
     }
 
-    /// Drop every cached entry and reset both cursors.
+    /// Drop every cached entry, reset both cursors and poison the cache.
     ///
-    /// Unlike [`Self::reset`], which follows the protocol and only rewinds the cursors,
-    /// this leaves no entry that a later `CacheHit` could resolve.
+    /// The server's cursors keep advancing, so entries stored after this point would sit at
+    /// indices the server never used. Until [`Self::reset`], lookups return `None` and stores
+    /// are discarded.
     pub fn clear(&mut self) {
+        self.poisoned = true;
         self.vbar_storage.fill(None);
         self.short_vbar_storage.fill(None);
         self.vbar_cursor = 0;
@@ -80,11 +89,17 @@ impl VBarCache {
 
     /// Get a full V-bar from cache by index.
     pub fn get_vbar(&self, index: u16) -> Option<&FullVBar> {
+        if self.poisoned {
+            return None;
+        }
         self.vbar_storage.get(usize::from(index)).and_then(|slot| slot.as_ref())
     }
 
     /// Get a short V-bar from cache by index.
     pub fn get_short_vbar(&self, index: u16) -> Option<&ShortVBar> {
+        if self.poisoned {
+            return None;
+        }
         self.short_vbar_storage
             .get(usize::from(index))
             .and_then(|slot| slot.as_ref())
@@ -92,6 +107,9 @@ impl VBarCache {
 
     /// Store a short V-bar and return its cache index.
     pub fn store_short_vbar(&mut self, short_vbar: ShortVBar) -> u16 {
+        if self.poisoned {
+            return self.short_vbar_cursor;
+        }
         let index = self.short_vbar_cursor;
         self.short_vbar_storage[usize::from(index)] = Some(short_vbar);
         self.short_vbar_cursor = (index + 1) % SHORT_VBAR_WRAP;
@@ -100,6 +118,9 @@ impl VBarCache {
 
     /// Store a full V-bar and return its cache index.
     pub fn store_vbar(&mut self, vbar: FullVBar) -> u16 {
+        if self.poisoned {
+            return self.vbar_cursor;
+        }
         let index = self.vbar_cursor;
         self.vbar_storage[usize::from(index)] = Some(vbar);
         self.vbar_cursor = (index + 1) % VBAR_WRAP;

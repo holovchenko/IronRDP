@@ -39,8 +39,10 @@ impl ClearCodecDecoder {
     /// For a caller that dropped a bitmap stream after a failed [`Self::decode`]. A failure
     /// part-way through a stream leaves the V-bar cursors behind the encoder's and the glyph
     /// slot unwritten, so later cache hits would resolve against the wrong entries and paint
-    /// without error. After this call every cache hit fails until the encoder refills the
-    /// slot it references.
+    /// without error. The glyph cache is emptied (glyph indices are explicit, so a refill is
+    /// safe). The V-bar caches are emptied and poisoned: V-bar indices follow the server's
+    /// cursor, which this decoder can no longer track, so every V-bar hit fails and misses
+    /// are painted but not stored until a stream carrying `FLAG_CACHE_RESET` arrives.
     pub fn invalidate_caches(&mut self) {
         self.vbar_cache.clear();
         self.glyph_cache.reset();
@@ -795,26 +797,69 @@ mod tests {
         let _ = decoder.decode(&reset_data, 0, 0); // zero dimensions, but cache reset still processed
     }
 
+    fn bands_stream(flags: u8, glyph_index: Option<u16>, band_vbars: &[u8], x_end: u16) -> Vec<u8> {
+        let mut band = Vec::new();
+        for v in [0u16, x_end, 0, 0] {
+            band.extend_from_slice(&v.to_le_bytes());
+        }
+        band.extend_from_slice(&[0, 0, 0]);
+        band.extend_from_slice(band_vbars);
+        let mut data = vec![flags, 0x00];
+        if let Some(idx) = glyph_index {
+            data.extend_from_slice(&idx.to_le_bytes());
+        }
+        data.extend_from_slice(&0u32.to_le_bytes());
+        data.extend_from_slice(&u32::try_from(band.len()).unwrap().to_le_bytes());
+        data.extend_from_slice(&0u32.to_le_bytes());
+        data.extend_from_slice(&band);
+        data
+    }
+
+    #[test]
+    fn invalidate_caches_keeps_vbar_hits_failing_until_cache_reset() {
+        let mut decoder = ClearCodecDecoder::new();
+        // Server slots 0 and 1 hold A (1,1,1) and B (2,2,2).
+        let setup = bands_stream(0, None, &[0x00, 0x01, 1, 1, 1, 0x00, 0x01, 2, 2, 2], 1);
+        decoder.decode(&setup, 2, 1).unwrap();
+        let failing = bands_stream(0, None, &[0x00, 0x01, 9, 9, 9, 0x40, 0x05, 0x00], 1);
+        decoder.decode(&failing, 2, 1).unwrap_err();
+        decoder.invalidate_caches();
+
+        // The server's cursor kept advancing; a miss must not be stored at client slot 0.
+        let miss_then_hit_0 = bands_stream(0, None, &[0x00, 0x01, 7, 7, 7, 0x00, 0x80], 1);
+        decoder.decode(&miss_then_hit_0, 2, 1).unwrap_err();
+    }
+
+    #[test]
+    fn cache_reset_after_invalidate_restores_vbar_cache() {
+        let mut decoder = ClearCodecDecoder::new();
+        decoder.invalidate_caches();
+
+        let reset_miss_hit = bands_stream(
+            FLAG_CACHE_RESET,
+            None,
+            &[0x00, 0x01, 7, 7, 7, 0x00, 0x01, 8, 8, 8, 0x01, 0x80, 0x00, 0x80],
+            3,
+        );
+        assert_eq!(
+            decoder.decode(&reset_miss_hit, 4, 1).unwrap(),
+            [7, 7, 7, 0xFF, 8, 8, 8, 0xFF, 8, 8, 8, 0xFF, 7, 7, 7, 0xFF]
+        );
+    }
+
+    #[test]
+    fn misses_while_poisoned_are_not_stored() {
+        let mut decoder = ClearCodecDecoder::new();
+        decoder.invalidate_caches();
+
+        let miss = bands_stream(0, None, &[0x00, 0x01, 7, 7, 7], 0);
+        decoder.decode(&miss, 1, 1).unwrap();
+        let hit_0 = bands_stream(0, None, &[0x00, 0x80], 0);
+        decoder.decode(&hit_0, 1, 1).unwrap_err();
+    }
+
     #[test]
     fn invalidate_caches_makes_prior_cache_hits_fail() {
-        fn bands_stream(flags: u8, glyph_index: Option<u16>, band_vbars: &[u8], x_end: u16) -> Vec<u8> {
-            let mut band = Vec::new();
-            for v in [0u16, x_end, 0, 0] {
-                band.extend_from_slice(&v.to_le_bytes());
-            }
-            band.extend_from_slice(&[0, 0, 0]);
-            band.extend_from_slice(band_vbars);
-            let mut data = vec![flags, 0x00];
-            if let Some(idx) = glyph_index {
-                data.extend_from_slice(&idx.to_le_bytes());
-            }
-            data.extend_from_slice(&0u32.to_le_bytes());
-            data.extend_from_slice(&u32::try_from(band.len()).unwrap().to_le_bytes());
-            data.extend_from_slice(&0u32.to_le_bytes());
-            data.extend_from_slice(&band);
-            data
-        }
-
         let mut decoder = ClearCodecDecoder::new();
         // V-bars 0 and 1 hold distinct colors; the same stream is a glyph at index 7.
         let setup = bands_stream(

@@ -1151,8 +1151,9 @@ impl GraphicsPipelineClient {
                     // resolve to a different, populated slot and paint wrong pixels with no
                     // error. The decoder's caches are therefore discarded, and no later PDU
                     // can paint from them: a hit on a discarded entry fails and is dropped
-                    // here. The caches become trustworthy again once the server resets them
-                    // (CLEARCODEC_FLAG_CACHE_RESET) or refills the entries it references.
+                    // here. V-bar hits keep failing (and are dropped, not fatal) until the server
+                    // sends CLEARCODEC_FLAG_CACHE_RESET: its cursors kept advancing, so the
+                    // client cannot tell which index a later miss was stored at.
                     // Ending the session would just get replayed by the reconnect.
                     // AVC420 errors, an unknown surface and a bad rectangle stay fatal.
                     if pdu.codec_id == Codec1Type::ClearCodec {
