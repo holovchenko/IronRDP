@@ -568,6 +568,11 @@ pub struct GraphicsPipelineClient {
     /// started and never how far it went. The count lives here so a caller that wants
     /// that number can read it; nothing in the crate reports it on its own.
     skipped_wire_to_surface2: u32,
+    /// Count of ClearCodec and Planar `WireToSurface1` PDUs dropped so far because
+    /// their payload failed to decode. Same warn-once/debug-after pattern as
+    /// `skipped_wire_to_surface2`. AVC444 has its own `skipped_avc444`; AVC420
+    /// decode errors stay fatal.
+    skipped_wire_to_surface1: u32,
     /// Count of AVC444/AVC444v2 `WireToSurface1` PDUs skipped so far (malformed
     /// stream info, missing/failed decoder, or chroma before any luma). Same
     /// warn-once/debug-after pattern as `skipped_wire_to_surface2`.
@@ -606,6 +611,7 @@ impl GraphicsPipelineClient {
             total_frames_decoded: 0,
             pending_reset: None,
             skipped_wire_to_surface2: 0,
+            skipped_wire_to_surface1: 0,
             skipped_avc444: 0,
             payload_tap: None,
         }
@@ -1123,11 +1129,42 @@ impl GraphicsPipelineClient {
                     pdu.codec_id,
                 )?;
             }
-            Codec1Type::ClearCodec => {
-                self.decode_clearcodec(pdu.surface_id, &pdu.destination_rectangle, &pdu.bitmap_data)?;
-            }
-            Codec1Type::Planar => {
-                self.decode_planar(pdu.surface_id, &pdu.destination_rectangle, &pdu.bitmap_data)?;
+            Codec1Type::ClearCodec | Codec1Type::Planar => {
+                let decoded = if pdu.codec_id == Codec1Type::ClearCodec {
+                    self.decode_clearcodec(pdu.surface_id, &pdu.destination_rectangle, &pdu.bitmap_data)
+                } else {
+                    self.decode_planar(pdu.surface_id, &pdu.destination_rectangle, &pdu.bitmap_data)
+                };
+                if let Err(error) = decoded {
+                    // Both decoders fail before `compositor.apply_bitmap` and
+                    // `on_bitmap_updated`, so no pixel from this PDU reaches the surface;
+                    // the region stays stale until the next update that touches it. Planar
+                    // keeps only a scratch buffer between PDUs. ClearCodec's caches are
+                    // protocol-persistent and are not rolled back: a cache reset flag or
+                    // V-bar entries stored before the failing layer stay applied. A later
+                    // PDU that references a half-updated entry can fail in turn and be
+                    // dropped the same way. Ending the session would just get replayed by
+                    // the reconnect.
+                    // AVC420 errors, an unknown surface and a bad rectangle stay fatal.
+                    self.skipped_wire_to_surface1 = self.skipped_wire_to_surface1.saturating_add(1);
+                    if self.skipped_wire_to_surface1 == 1 {
+                        warn!(
+                            ?error,
+                            surface_id = pdu.surface_id,
+                            codec_id = ?pdu.codec_id,
+                            "decode failed; dropping this WireToSurface1 update"
+                        );
+                    } else {
+                        // Every drop after the first: see `skipped_wire_to_surface1`.
+                        debug!(
+                            ?error,
+                            surface_id = pdu.surface_id,
+                            codec_id = ?pdu.codec_id,
+                            skipped_wire_to_surface1 = self.skipped_wire_to_surface1,
+                            "decode failed; dropping this WireToSurface1 update"
+                        );
+                    }
+                }
             }
             Codec1Type::Uncompressed => {
                 self.handle_uncompressed(pdu);
@@ -3242,6 +3279,112 @@ mod tests {
 
         assert!(client.is_active());
         assert_eq!(client.skipped_wire_to_surface2, 2);
+    }
+
+    #[test]
+    fn undecodable_clearcodec_and_planar_payloads_are_dropped_not_fatal() {
+        use ironrdp_graphics::clearcodec::ClearCodecEncoder;
+        use ironrdp_graphics::rdp6::{BitmapStreamEncoder, RgbChannels};
+
+        const W: u16 = 4;
+        const H: u16 = 2;
+
+        let dest_rect = ExclusiveRectangle {
+            left: 0,
+            top: 0,
+            right: W,
+            bottom: H,
+        };
+
+        let mut bgra = Vec::new();
+        for i in 0..u32::from(W) * u32::from(H) {
+            let i = u8::try_from(i).unwrap();
+            bgra.extend_from_slice(&[i, 100 + i, 200 + i, 0xFF]);
+        }
+        let clearcodec_valid = ClearCodecEncoder::new().encode(&bgra, W, H);
+
+        let mut rgb = Vec::new();
+        for i in 0..u8::try_from(W).unwrap() * u8::try_from(H).unwrap() {
+            rgb.extend_from_slice(&[i, 100 + i, 200 + i]);
+        }
+        let mut planar_valid = vec![0u8; rgb.len() * 4 + 64];
+        let len = BitmapStreamEncoder::new(usize::from(W), usize::from(H))
+            .encode_bitmap::<RgbChannels>(&rgb, &mut planar_valid, false)
+            .unwrap();
+        planar_valid.truncate(len);
+
+        // The surface and rectangle checks run first and pass; the lone header byte
+        // is shorter than any ClearCodec or Planar stream header, so the failure
+        // happens inside the codec decoder.
+        for (codec_id, valid) in [
+            (Codec1Type::ClearCodec, clearcodec_valid),
+            (Codec1Type::Planar, planar_valid),
+        ] {
+            let mut client = GraphicsPipelineClient::new(Box::new(TestHandler), None);
+            client
+                .handle_pdu(GfxPdu::CapabilitiesConfirm(
+                    crate::pdu::CapabilitiesConfirmPdu::from_typed(&CapabilitySet::V8 {
+                        flags: CapabilitiesV8Flags::empty(),
+                    }),
+                ))
+                .unwrap();
+            let _ = client.handle_pdu(GfxPdu::ResetGraphics(crate::pdu::ResetGraphicsPdu {
+                width: 200,
+                height: 100,
+                monitors: vec![],
+            }));
+            let _ = client.handle_pdu(GfxPdu::CreateSurface(crate::pdu::CreateSurfacePdu {
+                surface_id: 1,
+                width: W,
+                height: H,
+                pixel_format: PixelFormat::XRgb,
+            }));
+            let _ = client.handle_pdu(GfxPdu::MapSurfaceToOutput(crate::pdu::MapSurfaceToOutputPdu {
+                surface_id: 1,
+                output_origin_x: 0,
+                output_origin_y: 0,
+            }));
+            let _ = client.handle_pdu(GfxPdu::EndFrame(crate::pdu::EndFramePdu { frame_id: 0 }));
+            let _ = client.drain_output();
+
+            let wire = |bitmap_data: Vec<u8>| {
+                GfxPdu::WireToSurface1(crate::pdu::WireToSurface1Pdu {
+                    surface_id: 1,
+                    codec_id,
+                    pixel_format: PixelFormat::XRgb,
+                    destination_rectangle: dest_rect.clone(),
+                    bitmap_data,
+                })
+            };
+
+            let result = client.handle_pdu(wire(vec![0x00]));
+            assert!(
+                result.unwrap().is_empty(),
+                "{codec_id:?}: a bad payload must not be fatal"
+            );
+            assert!(client.is_active(), "{codec_id:?}");
+            assert_eq!(client.skipped_wire_to_surface1, 1, "{codec_id:?}");
+            let _ = client.handle_pdu(GfxPdu::EndFrame(crate::pdu::EndFramePdu { frame_id: 1 }));
+            assert!(
+                client.drain_output().is_empty(),
+                "{codec_id:?}: the dropped update must not reach the compositor"
+            );
+
+            let result = client.handle_pdu(wire(vec![0x00]));
+            assert!(result.unwrap().is_empty(), "{codec_id:?}");
+            assert_eq!(client.skipped_wire_to_surface1, 2, "{codec_id:?}");
+            let _ = client.handle_pdu(GfxPdu::EndFrame(crate::pdu::EndFramePdu { frame_id: 2 }));
+            assert!(client.drain_output().is_empty(), "{codec_id:?}");
+
+            client.handle_pdu(wire(valid)).unwrap();
+            let _ = client.handle_pdu(GfxPdu::EndFrame(crate::pdu::EndFramePdu { frame_id: 3 }));
+            assert_eq!(
+                client.drain_output().len(),
+                1,
+                "{codec_id:?}: a later valid payload still decodes"
+            );
+            assert_eq!(client.skipped_wire_to_surface1, 2, "{codec_id:?}");
+        }
     }
 
     #[test]
