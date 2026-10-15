@@ -34,6 +34,18 @@ impl ClearCodecDecoder {
         }
     }
 
+    /// Discard all cached state: V-bar entries, short V-bar entries, glyphs and cursors.
+    ///
+    /// For a caller that dropped a bitmap stream after a failed [`Self::decode`]. A failure
+    /// part-way through a stream leaves the V-bar cursors behind the encoder's and the glyph
+    /// slot unwritten, so later cache hits would resolve against the wrong entries and paint
+    /// without error. After this call every cache hit fails until the encoder refills the
+    /// slot it references.
+    pub fn invalidate_caches(&mut self) {
+        self.vbar_cache.clear();
+        self.glyph_cache.reset();
+    }
+
     /// Decode a ClearCodec bitmap stream into BGRA pixel data.
     ///
     /// The output buffer is `width * height * 4` bytes in BGRA format.
@@ -781,6 +793,50 @@ mod tests {
         // Cache reset message
         let reset_data = [FLAG_CACHE_RESET, 0x01]; // flags=CACHE_RESET, seq=1
         let _ = decoder.decode(&reset_data, 0, 0); // zero dimensions, but cache reset still processed
+    }
+
+    #[test]
+    fn invalidate_caches_makes_prior_cache_hits_fail() {
+        fn bands_stream(flags: u8, glyph_index: Option<u16>, band_vbars: &[u8], x_end: u16) -> Vec<u8> {
+            let mut band = Vec::new();
+            for v in [0u16, x_end, 0, 0] {
+                band.extend_from_slice(&v.to_le_bytes());
+            }
+            band.extend_from_slice(&[0, 0, 0]);
+            band.extend_from_slice(band_vbars);
+            let mut data = vec![flags, 0x00];
+            if let Some(idx) = glyph_index {
+                data.extend_from_slice(&idx.to_le_bytes());
+            }
+            data.extend_from_slice(&0u32.to_le_bytes());
+            data.extend_from_slice(&u32::try_from(band.len()).unwrap().to_le_bytes());
+            data.extend_from_slice(&0u32.to_le_bytes());
+            data.extend_from_slice(&band);
+            data
+        }
+
+        let mut decoder = ClearCodecDecoder::new();
+        // V-bars 0 and 1 hold distinct colors; the same stream is a glyph at index 7.
+        let setup = bands_stream(
+            FLAG_GLYPH_INDEX,
+            Some(7),
+            &[0x00, 0x01, 1, 1, 1, 0x00, 0x01, 2, 2, 2],
+            1,
+        );
+        decoder.decode(&setup, 2, 1).unwrap();
+
+        // A cache reset followed by a column that fails: the cursor is now behind the
+        // encoder's, and slot 1 still holds the pre-failure V-bar.
+        let failing = bands_stream(FLAG_CACHE_RESET, None, &[0x00, 0x01, 9, 9, 9, 0x40, 0x05, 0x00], 1);
+        decoder.decode(&failing, 2, 1).unwrap_err();
+        let hit_slot_1 = bands_stream(0, None, &0x8001u16.to_le_bytes(), 0);
+        assert_eq!(decoder.decode(&hit_slot_1, 1, 1).unwrap(), [2, 2, 2, 0xFF]);
+        let glyph_hit = [FLAG_GLYPH_INDEX | FLAG_GLYPH_HIT, 0x00, 7, 0];
+        decoder.decode(&glyph_hit, 2, 1).unwrap();
+
+        decoder.invalidate_caches();
+        decoder.decode(&hit_slot_1, 1, 1).unwrap_err();
+        decoder.decode(&glyph_hit, 2, 1).unwrap_err();
     }
 
     // --- Encoder tests ---

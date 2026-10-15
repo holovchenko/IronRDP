@@ -67,6 +67,17 @@ impl VBarCache {
         // but the cursor reset means new entries overwrite from index 0.
     }
 
+    /// Drop every cached entry and reset both cursors.
+    ///
+    /// Unlike [`Self::reset`], which follows the protocol and only rewinds the cursors,
+    /// this leaves no entry that a later `CacheHit` could resolve.
+    pub fn clear(&mut self) {
+        self.vbar_storage.fill(None);
+        self.short_vbar_storage.fill(None);
+        self.vbar_cursor = 0;
+        self.short_vbar_cursor = 0;
+    }
+
     /// Get a full V-bar from cache by index.
     pub fn get_vbar(&self, index: u16) -> Option<&FullVBar> {
         self.vbar_storage.get(usize::from(index)).and_then(|slot| slot.as_ref())
@@ -186,6 +197,22 @@ mod tests {
         assert_eq!(&full.pixels[3..9], &[0xFF, 0x00, 0x00, 0x00, 0xFF, 0x00]);
         // Row 3: background
         assert_eq!(&full.pixels[9..12], &[0xAA, 0xBB, 0xCC]);
+    }
+
+    #[test]
+    fn clear_drops_entries_and_cursors() {
+        let mut cache = VBarCache::new();
+        cache.store_vbar(FullVBar { pixels: vec![0x01] });
+        cache.store_short_vbar(ShortVBar {
+            y_on: 0,
+            pixel_count: 0,
+            pixels: vec![],
+        });
+        cache.clear();
+        assert!(cache.get_vbar(0).is_none());
+        assert!(cache.get_short_vbar(0).is_none());
+        assert_eq!(cache.vbar_cursor, 0);
+        assert_eq!(cache.short_vbar_cursor, 0);
     }
 
     #[test]

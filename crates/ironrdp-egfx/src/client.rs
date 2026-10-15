@@ -366,7 +366,12 @@ pub trait GraphicsPipelineHandler: Send {
     /// Reports the surface, the codec path taken, the codec payload size, and the wall
     /// time spent handling it. Fires for decoded codecs, codecs forwarded to
     /// [`GraphicsPipelineHandler::on_unhandled_pdu`], and progressive PDUs skipped after
-    /// a tile decode failure. Never called when handling returns `Err`.
+    /// a tile decode failure. Also fires for ClearCodec and Planar `WireToSurface1`
+    /// updates dropped after a decode failure. The callback alone cannot tell a dropped
+    /// update from a decoded one: only the absence of
+    /// [`GraphicsPipelineHandler::on_bitmap_updated`] and the "dropping this
+    /// WireToSurface1 update" log line (the drop count is a private field) show it.
+    /// Never called when handling returns `Err`.
     fn on_codec_processed(&mut self, _info: &CodecProcessed) {}
 
     /// Called when a logical frame is complete
@@ -1140,12 +1145,21 @@ impl GraphicsPipelineClient {
                     // `on_bitmap_updated`, so no pixel from this PDU reaches the surface;
                     // the region stays stale until the next update that touches it. Planar
                     // keeps only a scratch buffer between PDUs. ClearCodec's caches are
-                    // protocol-persistent and are not rolled back: a cache reset flag or
-                    // V-bar entries stored before the failing layer stay applied. A later
-                    // PDU that references a half-updated entry can fail in turn and be
-                    // dropped the same way. Ending the session would just get replayed by
-                    // the reconnect.
+                    // protocol-persistent and cannot be rolled back: a failure part-way
+                    // through the bands layer leaves the V-bar cursors behind the server's
+                    // (and a cache reset already applied), so a later `CacheHit` would
+                    // resolve to a different, populated slot and paint wrong pixels with no
+                    // error. The decoder's caches are therefore discarded, and no later PDU
+                    // can paint from them: a hit on a discarded entry fails and is dropped
+                    // here. The caches become trustworthy again once the server resets them
+                    // (CLEARCODEC_FLAG_CACHE_RESET) or refills the entries it references.
+                    // Ending the session would just get replayed by the reconnect.
                     // AVC420 errors, an unknown surface and a bad rectangle stay fatal.
+                    if pdu.codec_id == Codec1Type::ClearCodec {
+                        if let Some(decoder) = self.clearcodec_decoder.as_mut() {
+                            decoder.invalidate_caches();
+                        }
+                    }
                     self.skipped_wire_to_surface1 = self.skipped_wire_to_surface1.saturating_add(1);
                     if self.skipped_wire_to_surface1 == 1 {
                         warn!(
@@ -3385,6 +3399,160 @@ mod tests {
             );
             assert_eq!(client.skipped_wire_to_surface1, 2, "{codec_id:?}");
         }
+    }
+
+    /// A ClearCodec update that fails mid-layer-2 leaves the client V-bar cursor behind the
+    /// server's. Without discarding the caches, a later `CacheHit` resolves against a stale,
+    /// populated slot and paints the wrong column without any error.
+    #[test]
+    fn failed_clearcodec_update_discards_caches_so_later_hits_cannot_paint_stale_pixels() {
+        use ironrdp_pdu::codecs::clearcodec::FLAG_CACHE_RESET;
+
+        const W: u16 = 4;
+        const H: u16 = 1;
+
+        // One band, one row high, columns x_start..=x_end; each column is a
+        // SHORT_VBAR_CACHE_MISS covering row 0 (stores one short and one full V-bar).
+        fn clearcodec_pdu(flags: u8, bands: &[u8]) -> Vec<u8> {
+            let mut data = vec![flags, 0x00];
+            data.extend_from_slice(&0u32.to_le_bytes());
+            data.extend_from_slice(&u32::try_from(bands.len()).unwrap().to_le_bytes());
+            data.extend_from_slice(&0u32.to_le_bytes());
+            data.extend_from_slice(bands);
+            data
+        }
+        fn band(x_end: u16, vbars: &[u8]) -> Vec<u8> {
+            let mut b = Vec::new();
+            for v in [0u16, x_end, 0, 0] {
+                b.extend_from_slice(&v.to_le_bytes());
+            }
+            b.extend_from_slice(&[0, 0, 0]);
+            b.extend_from_slice(vbars);
+            b
+        }
+        fn short_miss(blue: u8, green: u8, red: u8) -> [u8; 5] {
+            // y_on = 0, y_off = 1
+            [0x00, 0x01, blue, green, red]
+        }
+
+        let mut client = GraphicsPipelineClient::new(Box::new(TestHandler), None);
+        client
+            .handle_pdu(GfxPdu::CapabilitiesConfirm(
+                crate::pdu::CapabilitiesConfirmPdu::from_typed(&CapabilitySet::V8 {
+                    flags: CapabilitiesV8Flags::empty(),
+                }),
+            ))
+            .unwrap();
+        let _ = client.handle_pdu(GfxPdu::ResetGraphics(crate::pdu::ResetGraphicsPdu {
+            width: 200,
+            height: 100,
+            monitors: vec![],
+        }));
+        let _ = client.handle_pdu(GfxPdu::CreateSurface(crate::pdu::CreateSurfacePdu {
+            surface_id: 1,
+            width: W,
+            height: H,
+            pixel_format: PixelFormat::XRgb,
+        }));
+        let _ = client.handle_pdu(GfxPdu::MapSurfaceToOutput(crate::pdu::MapSurfaceToOutputPdu {
+            surface_id: 1,
+            output_origin_x: 0,
+            output_origin_y: 0,
+        }));
+        let _ = client.handle_pdu(GfxPdu::EndFrame(crate::pdu::EndFramePdu { frame_id: 0 }));
+        let _ = client.drain_output();
+
+        let mut next_frame = 1;
+        let mut send = |client: &mut GraphicsPipelineClient, width: u16, bitmap_data: Vec<u8>| {
+            let result = client.handle_pdu(GfxPdu::WireToSurface1(crate::pdu::WireToSurface1Pdu {
+                surface_id: 1,
+                codec_id: Codec1Type::ClearCodec,
+                pixel_format: PixelFormat::XRgb,
+                destination_rectangle: ExclusiveRectangle {
+                    left: 0,
+                    top: 0,
+                    right: width,
+                    bottom: H,
+                },
+                bitmap_data,
+            }));
+            assert!(
+                result.unwrap().is_empty(),
+                "a ClearCodec decode failure must not be fatal"
+            );
+            let _ = client.handle_pdu(GfxPdu::EndFrame(crate::pdu::EndFramePdu { frame_id: next_frame }));
+            next_frame += 1;
+            client.drain_output().len()
+        };
+
+        // Setup: V-bars 0..=3 hold four distinct colors.
+        let mut columns = Vec::new();
+        for c in 1..=4u8 {
+            columns.extend_from_slice(&short_miss(c, c, c));
+        }
+        assert_eq!(send(&mut client, W, clearcodec_pdu(0, &band(3, &columns))), 1);
+        assert_eq!(client.skipped_wire_to_surface1, 0);
+
+        // Failing update: cache reset, column 0 is stored at index 0, column 1 is a short
+        // cache hit on an empty slot. The server stored a V-bar at index 1 here; the client
+        // did not.
+        let mut columns = Vec::new();
+        columns.extend_from_slice(&short_miss(9, 9, 9));
+        columns.extend_from_slice(&[0x40, 0x05, 0x00]);
+        assert_eq!(
+            send(&mut client, 2, clearcodec_pdu(FLAG_CACHE_RESET, &band(1, &columns))),
+            0
+        );
+        assert_eq!(client.skipped_wire_to_surface1, 1);
+
+        // The server believes index 1 is the column the failed update would have stored.
+        // The client's slot 1 still holds the setup color, so without discarding the caches
+        // this decodes and paints it.
+        let hit_index_1 = band(0, &0x8001u16.to_le_bytes());
+        assert_eq!(
+            send(&mut client, 1, clearcodec_pdu(0, &hit_index_1)),
+            0,
+            "a cache hit after a failed update must be dropped, not painted from pre-failure state"
+        );
+        assert_eq!(client.skipped_wire_to_surface1, 2);
+    }
+
+    #[test]
+    fn undecodable_avc420_payload_is_still_fatal() {
+        let mut client = GraphicsPipelineClient::new(Box::new(TestHandler), None);
+        client
+            .handle_pdu(GfxPdu::CapabilitiesConfirm(
+                crate::pdu::CapabilitiesConfirmPdu::from_typed(&CapabilitySet::V8 {
+                    flags: CapabilitiesV8Flags::empty(),
+                }),
+            ))
+            .unwrap();
+        let _ = client.handle_pdu(GfxPdu::ResetGraphics(crate::pdu::ResetGraphicsPdu {
+            width: 200,
+            height: 100,
+            monitors: vec![],
+        }));
+        let _ = client.handle_pdu(GfxPdu::CreateSurface(crate::pdu::CreateSurfacePdu {
+            surface_id: 1,
+            width: 4,
+            height: 2,
+            pixel_format: PixelFormat::XRgb,
+        }));
+
+        let result = client.handle_pdu(GfxPdu::WireToSurface1(crate::pdu::WireToSurface1Pdu {
+            surface_id: 1,
+            codec_id: Codec1Type::Avc420,
+            pixel_format: PixelFormat::XRgb,
+            destination_rectangle: ExclusiveRectangle {
+                left: 0,
+                top: 0,
+                right: 4,
+                bottom: 2,
+            },
+            bitmap_data: vec![0x00],
+        }));
+        assert!(result.is_err());
+        assert_eq!(client.skipped_wire_to_surface1, 0);
     }
 
     #[test]
