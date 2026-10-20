@@ -3466,6 +3466,8 @@ version = "0.10.0"
 dependencies = [
  "ironrdp-async",
  "ironrdp-connector",
+ "ironrdp-core 0.2.1",
+ "ironrdp-pdu",
  "reqwest",
  "tokio",
  "url",

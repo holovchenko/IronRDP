@@ -4,8 +4,11 @@
 #[rustfmt::skip] // do not re-order this pub use
 pub use ironrdp_async::*;
 
+pub mod legacy_security;
 #[cfg(feature = "reqwest")]
 pub mod reqwest;
+
+pub use legacy_security::LegacySecurityStream;
 
 use core::pin::Pin;
 use std::io;
