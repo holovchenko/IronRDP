@@ -1,14 +1,14 @@
 use core::{fmt, ops};
 
 #[derive(Debug, Clone)]
-pub(crate) struct Rc4 {
+pub struct Rc4 {
     i: usize,
     j: usize,
     state: State,
 }
 
 impl Rc4 {
-    pub(crate) fn new(key: &[u8]) -> Self {
+    pub fn new(key: &[u8]) -> Self {
         // key scheduling
         let mut state = State::default();
         for (i, item) in (0..=255).zip(state.iter_mut()) {
@@ -23,7 +23,7 @@ impl Rc4 {
         Self { i: 0, j: 0, state }
     }
 
-    pub(crate) fn process(&mut self, message: &[u8]) -> Vec<u8> {
+    pub fn process(&mut self, message: &[u8]) -> Vec<u8> {
         // PRGA
         let mut output = Vec::with_capacity(message.len());
         while output.capacity() > output.len() {

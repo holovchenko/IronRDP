@@ -26,7 +26,7 @@ pub mod x224;
 
 pub(crate) mod basic_output;
 pub(crate) mod ber;
-pub(crate) mod crypto;
+pub mod crypto;
 pub(crate) mod per;
 
 pub use crate::basic_output::{bitmap, fast_path, pointer, slow_path, surface_commands, window};
