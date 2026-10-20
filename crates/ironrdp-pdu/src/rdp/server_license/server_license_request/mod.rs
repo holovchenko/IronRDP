@@ -221,10 +221,13 @@ impl ServerCertificate {
 
         match &self.certificate {
             CertificateType::Proprietary(certificate) => {
-                let public_exponent = certificate.public_key.public_exponent.to_le_bytes();
+                // The proprietary certificate stores the modulus little-endian, DER wants big-endian.
+                let public_exponent = certificate.public_key.public_exponent.to_be_bytes();
+                let mut modulus = certificate.public_key.modulus.clone();
+                modulus.reverse();
 
                 let rsa_public_key = pkcs1::RsaPublicKey {
-                    modulus: pkcs1::UintRef::new(&certificate.public_key.modulus)?,
+                    modulus: pkcs1::UintRef::new(&modulus)?,
                     public_exponent: pkcs1::UintRef::new(&public_exponent)?,
                 };
 

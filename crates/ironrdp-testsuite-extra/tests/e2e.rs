@@ -1022,6 +1022,7 @@ fn default_client_config() -> connector::Config {
         enable_tls: true,
         enable_credssp: true,
         enable_standard_rdp_security: false,
+        legacy_security: None,
         credentials: connector::Credentials::UsernamePassword {
             username: USERNAME.into(),
             password: PASSWORD.into(),

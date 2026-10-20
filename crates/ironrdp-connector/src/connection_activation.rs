@@ -1228,6 +1228,7 @@ mod tessera_guard2_tests {
             enable_tls: true,
             enable_credssp: false,
             enable_standard_rdp_security: false,
+            legacy_security: None,
             credentials: Credentials::UsernamePassword {
                 username: "test".into(),
                 password: "test".into(),

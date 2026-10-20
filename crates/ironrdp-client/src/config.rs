@@ -1857,6 +1857,7 @@ impl ConfigBuilder {
             enable_tls,
             enable_credssp,
             enable_standard_rdp_security,
+            legacy_security: None,
             keyboard_type: self
                 .keyboard_type
                 .unwrap_or(ironrdp_pdu::gcc::KeyboardType::IBM_ENHANCED),

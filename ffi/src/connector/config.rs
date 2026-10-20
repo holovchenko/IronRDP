@@ -196,6 +196,7 @@ pub mod ffi {
                 enable_tls: self.enable_tls.unwrap_or(false),
                 enable_credssp: self.enable_credssp.unwrap_or(true),
                 enable_standard_rdp_security: false,
+                legacy_security: None,
                 keyboard_layout: self.keyboard_layout.unwrap_or(0),
                 keyboard_type: self
                     .keyboard_type

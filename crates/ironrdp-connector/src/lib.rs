@@ -203,13 +203,19 @@ pub struct Config {
     ///
     /// When both [`enable_tls`](Self::enable_tls) and [`enable_credssp`](Self::enable_credssp) are
     /// `false`, the connector would otherwise advertise no enhanced protocols. IronRDP only supports
-    /// the `ENCRYPTION_LEVEL_NONE` variant of standard RDP security (no RC4 Security Exchange), which
-    /// is appropriate for trusted local transports such as Windows Sandbox named pipes — not for
-    /// ordinary TCP sessions.
+    /// the `ENCRYPTION_LEVEL_NONE` variant of standard RDP security, which is appropriate for trusted
+    /// local transports such as Windows Sandbox named pipes, and RC4 encryption when
+    /// [`legacy_security`](Self::legacy_security) is set.
     ///
-    /// Defaults should stay `false`. Enable this only for known-local paths that opt in explicitly
-    /// (e.g. `Transport::NamedPipe`).
+    /// Defaults should stay `false`. Enable this only for known-local paths or an explicit opt-in to
+    /// legacy security.
     pub enable_standard_rdp_security: bool,
+    /// Receives the RC4 session keys when the server requires Standard RDP Security with encryption.
+    ///
+    /// The connector arms this handle while performing the Security Exchange; the transport layer
+    /// holds a clone and applies it to every frame. When `None`, a server that demands encryption
+    /// fails the connection.
+    pub legacy_security: Option<legacy_security::LegacySecurityHandle>,
     pub credentials: Credentials,
     pub domain: Option<String>,
     /// The build number of the client.

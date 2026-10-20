@@ -6,16 +6,20 @@ use std::sync::Arc;
 
 use ironrdp_core::{Encode, WriteBuf, decode, encode_vec};
 use ironrdp_pdu::rdp::capability_sets::WindowSupportLevel;
+use ironrdp_pdu::rdp::security_exchange::SecurityExchangePdu;
+use ironrdp_pdu::rdp::server_license::ServerCertificate;
 use ironrdp_pdu::rdp::session_info::ServerAutoReconnect;
 use ironrdp_pdu::x224::X224;
 use ironrdp_pdu::{PduHint, gcc, mcs, nego, rdp};
 use ironrdp_svc::{MAX_STATIC_CHANNELS, StaticChannelKey, StaticChannelSet, StaticVirtualChannel, SvcClientProcessor};
+use rand::RngCore as _;
 use tracing::{debug, error, info, warn};
 
 use crate::channel_connection::{ChannelConnectionSequence, ChannelConnectionState};
 use crate::connection_activation::{
     ConnectionActivationFactory, ConnectionActivationSequence, ConnectionActivationState,
 };
+use crate::legacy_security::{LegacySecurityCodec, SessionKeys, encrypt_client_random};
 use crate::license_exchange::{LicenseExchangeSequence, NoopLicenseCache};
 use crate::{
     Config, ConnectorError, ConnectorErrorExt as _, ConnectorErrorKind, ConnectorResult, DesktopSize, MonotonicInstant,
@@ -197,6 +201,12 @@ pub enum ClientConnectorState {
         io_channel_id: u16,
         channel_connection: ChannelConnectionSequence,
     },
+    /// Standard RDP Security with RC4: send the client random encrypted with the server public
+    /// key and arm [`Config::legacy_security`], MS-RDPBCGR 5.3.2.
+    SecurityExchange {
+        io_channel_id: u16,
+        user_channel_id: u16,
+    },
     SecureSettingsExchange {
         io_channel_id: u16,
         user_channel_id: u16,
@@ -287,6 +297,7 @@ impl State for ClientConnectorState {
             Self::BasicSettingsExchangeSendInitial { .. } => "BasicSettingsExchangeSendInitial",
             Self::BasicSettingsExchangeWaitResponse { .. } => "BasicSettingsExchangeWaitResponse",
             Self::ChannelConnection { .. } => "ChannelConnection",
+            Self::SecurityExchange { .. } => "SecurityExchange",
             Self::SecureSettingsExchange { .. } => "SecureSettingsExchange",
             Self::ConnectTimeAutoDetection { .. } => "ConnectTimeAutoDetection",
             Self::LicensingExchange { .. } => "LicensingExchange",
@@ -324,6 +335,8 @@ pub struct ClientConnector {
     pub static_channels: StaticChannelSet,
     /// MCS message channel ID assigned by the server, once negotiated.
     pub message_channel_id: Option<u16>,
+    /// What the Security Exchange needs from the server's GCC response, when it demands RC4.
+    legacy_security_params: Option<LegacySecurityParams>,
     cluster_data: Option<gcc::ClientClusterData>,
     load_balance_info: Option<String>,
     /// X.224 negotiation flags supplied by the server.
@@ -356,6 +369,14 @@ pub struct ClientConnector {
     multitransport_skip_count: u32,
 }
 
+/// Server parameters taken from the SC_SECURITY block for the Security Exchange.
+#[derive(Debug)]
+struct LegacySecurityParams {
+    method: gcc::EncryptionMethod,
+    server_random: [u8; 32],
+    public_key_der: Vec<u8>,
+}
+
 impl ClientConnector {
     pub fn new(config: Config, client_addr: SocketAddr) -> Self {
         Self {
@@ -364,6 +385,7 @@ impl ClientConnector {
             client_addr,
             static_channels: StaticChannelSet::new(),
             message_channel_id: None,
+            legacy_security_params: None,
             cluster_data: None,
             load_balance_info: None,
             response_flags: nego::ResponseFlags::empty(),
@@ -444,10 +466,11 @@ impl ClientConnector {
             security_protocol.insert(nego::SecurityProtocol::HYBRID | nego::SecurityProtocol::HYBRID_EX);
         }
 
-        // PROTOCOL_RDP (empty flags) is standard RDP security. IronRDP only supports the
-        // ENCRYPTION_LEVEL_NONE variant (no RC4 Security Exchange). Keep it opt-in so
+        // PROTOCOL_RDP (empty flags) is standard RDP security: either ENCRYPTION_LEVEL_NONE or
+        // RC4 via the Security Exchange (which needs `Config::legacy_security`). Keep it opt-in so
         // `enable_tls = false` + `enable_credssp = false` cannot silently open a plaintext
-        // TCP session; local named-pipe transports set `enable_standard_rdp_security`.
+        // TCP session; local named-pipe transports and the explicit legacy retry set
+        // `enable_standard_rdp_security`.
         if security_protocol.is_standard_rdp_security() {
             if !self.config.enable_standard_rdp_security {
                 return Err(reason_err!("Initiation", "standard RDP security is not supported"));
@@ -456,6 +479,42 @@ impl ClientConnector {
         }
 
         Ok(security_protocol)
+    }
+
+    /// Validates the server's SC_SECURITY block against what a standard-security client supports.
+    ///
+    /// Returns `None` for `ENCRYPTION_LEVEL_NONE`, which needs no Security Exchange.
+    fn legacy_security_params_from(
+        &self,
+        security: &gcc::ServerSecurityData,
+    ) -> ConnectorResult<Option<LegacySecurityParams>> {
+        use gcc::{EncryptionLevel, EncryptionMethod};
+
+        if security.encryption_level == EncryptionLevel::None {
+            return Ok(None);
+        }
+        if security.encryption_level == EncryptionLevel::Fips
+            || security.encryption_method.contains(EncryptionMethod::FIPS)
+        {
+            return Err(reason_err!(
+                "Initiation",
+                "server requires FIPS encryption, which Tessera does not support"
+            ));
+        }
+        if self.config.legacy_security.is_none() {
+            return Err(reason_err!("SecurityExchange", "legacy security handle missing"));
+        }
+
+        let server_random = security
+            .server_random
+            .ok_or_else(|| reason_err!("SecurityExchange", "server random is missing"))?;
+        let certificate = decode::<ServerCertificate>(&security.server_cert).map_err(ConnectorError::decode)?;
+
+        Ok(Some(LegacySecurityParams {
+            method: security.encryption_method,
+            server_random,
+            public_key_der: server_public_key(&certificate)?,
+        }))
     }
 
     fn encode_connection_request(
@@ -1088,6 +1147,7 @@ impl Sequence for ClientConnector {
             ClientConnectorState::BasicSettingsExchangeSendInitial { .. } => None,
             ClientConnectorState::BasicSettingsExchangeWaitResponse { .. } => Some(&ironrdp_pdu::X224_HINT),
             ClientConnectorState::ChannelConnection { channel_connection, .. } => channel_connection.next_pdu_hint(),
+            ClientConnectorState::SecurityExchange { .. } => None,
             ClientConnectorState::SecureSettingsExchange { .. } => None,
             ClientConnectorState::ConnectTimeAutoDetection { .. } => {
                 // Wait for input only when a message channel was negotiated, so
@@ -1248,10 +1308,12 @@ impl Sequence for ClientConnector {
 
                 let server_gcc_blocks = connect_response.conference_create_response.into_gcc_blocks();
 
-                if client_gcc_blocks.security == gcc::ClientSecurityData::no_security()
-                    && server_gcc_blocks.security != gcc::ServerSecurityData::no_security()
-                {
-                    return Err(general_err!("can't satisfy server security settings"));
+                if client_gcc_blocks.security == gcc::ClientSecurityData::no_security() {
+                    if server_gcc_blocks.security != gcc::ServerSecurityData::no_security() {
+                        return Err(general_err!("can't satisfy server security settings"));
+                    }
+                } else {
+                    self.legacy_security_params = self.legacy_security_params_from(&server_gcc_blocks.security)?;
                 }
 
                 self.message_channel_id = server_gcc_blocks
@@ -1313,9 +1375,16 @@ impl Sequence for ClientConnector {
                 {
                     debug_assert!(channel_connection.state.is_terminal());
 
-                    ClientConnectorState::SecureSettingsExchange {
-                        io_channel_id,
-                        user_channel_id,
+                    if self.legacy_security_params.is_some() {
+                        ClientConnectorState::SecurityExchange {
+                            io_channel_id,
+                            user_channel_id,
+                        }
+                    } else {
+                        ClientConnectorState::SecureSettingsExchange {
+                            io_channel_id,
+                            user_channel_id,
+                        }
                     }
                 } else {
                     ClientConnectorState::ChannelConnection {
@@ -1328,11 +1397,52 @@ impl Sequence for ClientConnector {
             }
 
             //== RDP Security Commencement ==//
-            // With standard RDP security and ENCRYPTION_LEVEL_NONE, no Security Exchange PDU is
-            // sent (MS-RDPBCGR 5.3.2). IronRDP only supports that no-encryption path; RC4/FIPS
-            // would require a Security Exchange here and is rejected earlier when the server's
-            // SC_SECURITY block is not ServerSecurityData::no_security().
-            //==============================//
+            // With ENCRYPTION_LEVEL_NONE no Security Exchange PDU is sent (MS-RDPBCGR 5.3.2) and
+            // the connector goes straight to the Secure Settings Exchange. When the server selected
+            // RC4 (40/56/128-bit), the client random is sent encrypted with the server public key
+            // and the session keys are derived (5.3.4, 5.3.5). The Security Exchange PDU itself is
+            // not encrypted, so the handle is armed before it is written: the codec starts in the
+            // outbound phase that passes it through and encrypts everything after it. FIPS is
+            // rejected when the server's GCC response is processed.
+            ClientConnectorState::SecurityExchange {
+                io_channel_id,
+                user_channel_id,
+            } => {
+                debug!("Security Exchange");
+
+                let params = self
+                    .legacy_security_params
+                    .take()
+                    .ok_or_else(|| general_err!("security exchange parameters are missing (this is a bug)"))?;
+                let handle = self
+                    .config
+                    .legacy_security
+                    .as_ref()
+                    .ok_or_else(|| reason_err!("SecurityExchange", "legacy security handle missing"))?;
+
+                let mut client_random = [0u8; 32];
+                rand::rng().fill_bytes(&mut client_random);
+
+                let encrypted_client_random = encrypt_client_random(&client_random, &params.public_key_der)?;
+                let keys = SessionKeys::derive(&client_random, &params.server_random, params.method)?;
+                handle.arm(LegacySecurityCodec::new(keys, io_channel_id, self.message_channel_id));
+
+                let pdu = SecurityExchangePdu {
+                    encrypted_client_random,
+                };
+
+                debug!(message = ?pdu, "Send");
+
+                let written = encode_send_data_request(user_channel_id, io_channel_id, &pdu, output)?;
+
+                (
+                    Written::from_size(written)?,
+                    ClientConnectorState::SecureSettingsExchange {
+                        io_channel_id,
+                        user_channel_id,
+                    },
+                )
+            }
 
             //== Secure Settings Exchange ==//
             // Send Client Info PDU (information about supported types of compression, username, password, etc).
@@ -1686,6 +1796,13 @@ impl Sequence for ClientConnector {
     }
 }
 
+/// RSA public key (PKCS#1 DER) of the server certificate.
+fn server_public_key(certificate: &ServerCertificate) -> ConnectorResult<Vec<u8>> {
+    certificate
+        .get_public_key()
+        .map_err(|e| ConnectorError::custom("server public key", e))
+}
+
 pub fn encode_send_data_request<T: Encode>(
     initiator_id: u16,
     channel_id: u16,
@@ -1715,8 +1832,8 @@ fn create_gcc_blocks<'a>(
 ) -> ConnectorResult<gcc::ClientGccBlocks> {
     use ironrdp_pdu::gcc::{
         ClientCoreData, ClientCoreOptionalData, ClientEarlyCapabilityFlags, ClientGccBlocks, ClientNetworkData,
-        ClientSecurityData, ColorDepth, EncryptionMethod, HighColorDepth, MonitorOrientation, RdpVersion,
-        SecureAccessSequence, SupportedColorDepths,
+        ClientSecurityData, ColorDepth, HighColorDepth, MonitorOrientation, RdpVersion, SecureAccessSequence,
+        SupportedColorDepths,
     };
 
     let max_color_depth = config.bitmap.as_ref().map(|bitmap| bitmap.color_depth).unwrap_or(32);
@@ -1806,9 +1923,10 @@ fn create_gcc_blocks<'a>(
                 },
             },
         },
-        security: ClientSecurityData {
-            encryption_methods: EncryptionMethod::empty(),
-            ext_encryption_methods: 0,
+        security: if config.enable_standard_rdp_security && selected_protocol.is_standard_rdp_security() {
+            ClientSecurityData::rc4()
+        } else {
+            ClientSecurityData::no_security()
         },
         network: if channels.is_empty() {
             None
@@ -1966,6 +2084,7 @@ mod tests {
             enable_tls: true,
             enable_credssp: false,
             enable_standard_rdp_security: false,
+            legacy_security: None,
             credentials: Credentials::UsernamePassword {
                 username: "test".into(),
                 password: "test".into(),
@@ -2022,6 +2141,7 @@ mod tests {
             enable_tls: true,
             enable_credssp: false,
             enable_standard_rdp_security: false,
+            legacy_security: None,
             credentials: Credentials::UsernamePassword {
                 username: "test".into(),
                 password: "test".into(),
@@ -2087,6 +2207,7 @@ mod tests {
             enable_tls: true,
             enable_credssp: false,
             enable_standard_rdp_security: false,
+            legacy_security: None,
             credentials: Credentials::UsernamePassword {
                 username: "test".into(),
                 password: "test".into(),
@@ -2250,6 +2371,7 @@ mod tests {
             enable_tls: true,
             enable_credssp: false,
             enable_standard_rdp_security: false,
+            legacy_security: None,
             credentials: Credentials::UsernamePassword {
                 username: "test".into(),
                 password: "test".into(),
@@ -2346,6 +2468,7 @@ mod tests {
             enable_tls: true,
             enable_credssp: false,
             enable_standard_rdp_security: false,
+            legacy_security: None,
             credentials: Credentials::UsernamePassword {
                 username: "test".into(),
                 password: "test".into(),
@@ -2551,5 +2674,226 @@ mod tests {
             "an I/O-channel PDU must end the phase, but the connector stayed in {}",
             connector.state.name()
         );
+    }
+
+    mod security_exchange {
+        use ironrdp_core::{WriteBuf, decode, encode_vec};
+        use ironrdp_pdu::gcc::{EncryptionLevel, EncryptionMethod};
+        use ironrdp_pdu::rdp::headers::BasicSecurityHeaderFlags;
+        use ironrdp_pdu::rdp::server_license::ServerCertificate;
+        use ironrdp_pdu::rdp::server_license::cert::{CertificateType, ProprietaryCertificate, RsaPublicKey};
+        use ironrdp_pdu::x224::X224;
+        use ironrdp_pdu::{gcc, mcs, nego};
+
+        use super::super::{ClientConnector, create_gcc_blocks};
+        use crate::legacy_security::LegacySecurityHandle;
+        use crate::{Config, Sequence as _, State as _, encode_x224_packet};
+
+        // MS-RDPBCGR 4.1.4: server random and 512-bit proprietary-certificate modulus.
+        const SERVER_RANDOM: &str = "1011772030610a12e434a11ef2c39f317da45f01893496e0ff1108697f1ac3d2";
+        const SERVER_MODULUS_BE: &str = "bc125626638883d1f6c11fa6551fb1a031fd01a2e57968ea7532ffe8ae552d3cc89bfbc4960270f83d0c5ff1cba5f1d69471f8872e5fd50555c3616dbafe81cb";
+
+        const IO_CHANNEL_ID: u16 = 1003;
+        const USER_CHANNEL_ID: u16 = 1007;
+        const MESSAGE_CHANNEL_ID: u16 = 1004;
+
+        fn unhex(s: &str) -> Vec<u8> {
+            s.as_bytes()
+                .chunks(2)
+                .map(|pair| u8::from_str_radix(core::str::from_utf8(pair).unwrap(), 16).unwrap())
+                .collect()
+        }
+
+        fn server_cert() -> Vec<u8> {
+            let mut modulus: Vec<u8> = unhex(SERVER_MODULUS_BE).into_iter().rev().collect();
+            modulus.extend([0; 8]);
+
+            encode_vec(&ServerCertificate {
+                issued_permanently: false,
+                certificate: CertificateType::Proprietary(ProprietaryCertificate {
+                    public_key: RsaPublicKey {
+                        public_exponent: 65537,
+                        modulus,
+                    },
+                    signature: vec![0; 72],
+                }),
+            })
+            .unwrap()
+        }
+
+        fn server_security(level: EncryptionLevel, method: EncryptionMethod) -> gcc::ServerSecurityData {
+            gcc::ServerSecurityData {
+                encryption_method: method,
+                encryption_level: level,
+                server_random: Some(unhex(SERVER_RANDOM).try_into().unwrap()),
+                server_cert: server_cert(),
+            }
+        }
+
+        fn legacy_config(handle: Option<LegacySecurityHandle>) -> Config {
+            let mut config = super::minimal_config();
+            config.enable_tls = false;
+            config.enable_standard_rdp_security = true;
+            config.legacy_security = handle;
+            config
+        }
+
+        fn connector_waiting_for_server_gcc(config: Config) -> ClientConnector {
+            let blocks = create_gcc_blocks(
+                &config,
+                None,
+                nego::SecurityProtocol::empty(),
+                true,
+                core::iter::empty(),
+            )
+            .expect("valid GCC blocks");
+            let connect_initial = mcs::ConnectInitial::with_gcc_blocks(blocks).unwrap();
+
+            let mut connector = ClientConnector::new(config, "127.0.0.1:3389".parse().unwrap());
+            connector.state = super::super::ClientConnectorState::BasicSettingsExchangeWaitResponse { connect_initial };
+            connector
+        }
+
+        fn connect_response(security: gcc::ServerSecurityData) -> Vec<u8> {
+            let blocks = gcc::ServerGccBlocks {
+                core: gcc::ServerCoreData {
+                    version: gcc::RdpVersion::V5_PLUS,
+                    optional_data: gcc::ServerCoreOptionalData {
+                        client_requested_protocols: Some(nego::SecurityProtocol::empty()),
+                        early_capability_flags: Some(gcc::ServerEarlyCapabilityFlags::SKIP_CHANNELJOIN_SUPPORTED),
+                    },
+                },
+                network: gcc::ServerNetworkData {
+                    channel_ids: Vec::new(),
+                    io_channel: IO_CHANNEL_ID,
+                },
+                security,
+                message_channel: Some(gcc::ServerMessageChannelData {
+                    mcs_message_channel_id: MESSAGE_CHANNEL_ID,
+                }),
+                multi_transport_channel: None,
+            };
+            let response = mcs::ConnectResponse {
+                conference_create_response: gcc::ConferenceCreateResponse::new(USER_CHANNEL_ID, blocks).unwrap(),
+                called_connect_id: 1,
+                domain_parameters: mcs::DomainParameters::target(),
+            };
+            let mut buf = WriteBuf::new();
+            encode_x224_packet(&response, &mut buf).unwrap();
+            buf.into_inner()
+        }
+
+        /// Steps the connector through the server's GCC response and the (skipped-join) channel
+        /// connection, leaving it on the first state after the channel connection.
+        fn run_to_end_of_channel_connection(connector: &mut ClientConnector, security: gcc::ServerSecurityData) {
+            let mut output = WriteBuf::new();
+            connector
+                .step(&connect_response(security), None, &mut output)
+                .expect("server GCC response is accepted");
+            assert_eq!(connector.state.name(), "ChannelConnection");
+
+            connector.step(&[], None, &mut output).expect("erect domain");
+            connector.step(&[], None, &mut output).expect("attach user");
+            let confirm = encode_vec(&X224(mcs::AttachUserConfirm {
+                result: 0,
+                initiator_id: USER_CHANNEL_ID,
+            }))
+            .unwrap();
+            connector
+                .step(&confirm, None, &mut output)
+                .expect("attach user confirm");
+        }
+
+        #[test]
+        fn rc4_server_leads_to_security_exchange_and_arms_handle() {
+            let handle = LegacySecurityHandle::default();
+            let mut connector = connector_waiting_for_server_gcc(legacy_config(Some(handle.clone())));
+
+            run_to_end_of_channel_connection(
+                &mut connector,
+                server_security(EncryptionLevel::High, EncryptionMethod::BIT_128),
+            );
+            assert_eq!(connector.state.name(), "SecurityExchange");
+            assert!(!handle.is_armed());
+
+            let mut output = WriteBuf::new();
+            connector.step(&[], None, &mut output).expect("security exchange");
+
+            assert_eq!(connector.state.name(), "SecureSettingsExchange");
+            assert!(handle.is_armed());
+
+            let request = decode::<X224<mcs::SendDataRequest<'_>>>(output.filled()).unwrap().0;
+            assert_eq!(request.initiator_id, USER_CHANNEL_ID);
+            assert_eq!(request.channel_id, IO_CHANNEL_ID);
+            // Basic security header (4) + length (4) + 64-byte modulus-sized random + 8 zero padding.
+            assert_eq!(request.user_data.len(), 80);
+            let flags = u16::from_le_bytes([request.user_data[0], request.user_data[1]]);
+            assert_eq!(flags, BasicSecurityHeaderFlags::EXCHANGE_PKT.bits());
+            assert_eq!(
+                u32::from_le_bytes(request.user_data[4..8].try_into().unwrap()),
+                72,
+                "length field covers the encrypted random plus padding"
+            );
+            assert_eq!(&request.user_data[72..80], &[0; 8]);
+        }
+
+        #[test]
+        fn proprietary_certificate_yields_the_big_endian_public_key() {
+            let public_key = {
+                let cert = decode::<ServerCertificate>(&server_cert()).unwrap();
+                super::super::server_public_key(&cert).unwrap()
+            };
+
+            let mut expected = vec![0x30, 0x48, 0x02, 0x41, 0x00];
+            expected.extend(unhex(SERVER_MODULUS_BE));
+            expected.extend([0x02, 0x03, 0x01, 0x00, 0x01]);
+            assert_eq!(public_key, expected);
+        }
+
+        #[test]
+        fn fips_server_is_rejected_with_spec_message() {
+            let mut connector = connector_waiting_for_server_gcc(legacy_config(Some(LegacySecurityHandle::default())));
+            let mut output = WriteBuf::new();
+
+            let err = connector
+                .step(
+                    &connect_response(server_security(EncryptionLevel::Fips, EncryptionMethod::FIPS)),
+                    None,
+                    &mut output,
+                )
+                .unwrap_err();
+
+            assert!(
+                format!("{err:?}").contains("server requires FIPS encryption, which Tessera does not support"),
+                "{err:?}"
+            );
+        }
+
+        #[test]
+        fn rc4_without_handle_is_an_error() {
+            let mut connector = connector_waiting_for_server_gcc(legacy_config(None));
+            let mut output = WriteBuf::new();
+
+            let err = connector
+                .step(
+                    &connect_response(server_security(EncryptionLevel::High, EncryptionMethod::BIT_128)),
+                    None,
+                    &mut output,
+                )
+                .unwrap_err();
+
+            assert!(format!("{err:?}").contains("legacy security handle missing"), "{err:?}");
+        }
+
+        #[test]
+        fn encryption_level_none_keeps_existing_path() {
+            let handle = LegacySecurityHandle::default();
+            let mut connector = connector_waiting_for_server_gcc(legacy_config(Some(handle.clone())));
+
+            run_to_end_of_channel_connection(&mut connector, gcc::ServerSecurityData::no_security());
+
+            assert_eq!(connector.state.name(), "SecureSettingsExchange");
+            assert!(!handle.is_armed());
+        }
     }
 }
