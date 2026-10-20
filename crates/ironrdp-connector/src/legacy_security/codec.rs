@@ -18,10 +18,18 @@ const FAST_PATH_SECURE_CHECKSUM: u8 = 0x40;
 const FAST_PATH_ENCRYPTED: u8 = 0x80;
 const MAX_PER_LENGTH: usize = 0x7FFF;
 
+/// Flags that only describe the crypto layer (FLAGSHI_VALID marks the header's high word as valid,
+/// MS-RDPBCGR 2.2.8.1.1.2.1); they are consumed here and never reach the layers above.
 const CRYPTO_FLAGS: BasicSecurityHeaderFlags = BasicSecurityHeaderFlags::ENCRYPT
     .union(BasicSecurityHeaderFlags::SECURE_CHECKSUM)
     .union(BasicSecurityHeaderFlags::RESET_SEQNO)
-    .union(BasicSecurityHeaderFlags::IGNORE_SEQNO);
+    .union(BasicSecurityHeaderFlags::IGNORE_SEQNO)
+    .union(BasicSecurityHeaderFlags::FLAGSHI_VALID);
+
+/// PDUs the server may interleave into licensing; any other PDU on the I/O channel means Active.
+const LICENSING_PHASE_FLAGS: BasicSecurityHeaderFlags = BasicSecurityHeaderFlags::LICENSE_PKT
+    .union(BasicSecurityHeaderFlags::AUTODETECT_REQ)
+    .union(BasicSecurityHeaderFlags::HEARTBEAT);
 
 fn remaining_flags(flags: BasicSecurityHeaderFlags) -> BasicSecurityHeaderFlags {
     flags.difference(CRYPTO_FLAGS)
@@ -119,9 +127,11 @@ impl LegacySecurityCodec {
             body.to_vec()
         };
 
-        // Only a header with nothing but crypto flags is Active data: Windows interleaves other PDUs
-        // (e.g. an Auto-Detect Request, SEC_AUTODETECT_REQ) into licensing.
-        if slow.channel_id == self.io_channel_id && self.phase == Phase::Licensing && remaining_flags(flags).is_empty()
+        // Windows interleaves licensing-phase PDUs (e.g. an Auto-Detect Request, SEC_AUTODETECT_REQ) into
+        // licensing; the first I/O channel PDU that is none of them (the Demand Active) starts Active.
+        if slow.channel_id == self.io_channel_id
+            && self.phase == Phase::Licensing
+            && !flags.intersects(LICENSING_PHASE_FLAGS)
         {
             self.phase = Phase::Active;
         }
@@ -168,6 +178,10 @@ impl LegacySecurityCodec {
         } else {
             (false, true, self.phase)
         };
+        // Outbound PDUs carrying a header on the I/O channel are limited to the handshake ones above:
+        // the connector and session answer Auto-Detect and Multitransport requests on the message
+        // channel only (`message_channel_id` is required to respond), so no other header-bearing
+        // PDU is ever produced there.
 
         self.phase = next_phase;
 
@@ -754,6 +768,49 @@ mod tests {
 
         assert_eq!(codec.phase, Phase::Licensing);
         assert_eq!(codec.encrypt_outbound(&reply).unwrap(), reply);
+    }
+
+    #[test]
+    fn demand_active_with_flagshi_valid_header_ends_licensing_and_loses_its_header() {
+        let mut codec = client();
+        codec.phase = Phase::Licensing;
+        let mut server = server_keys();
+        let payload = vec![0x42; 20];
+
+        // SEC_FLAGSHI_VALID | SEC_ENCRYPT, MS-RDPBCGR 2.2.8.1.1.2.1
+        let frame = encrypted_indication(&mut server, IO, 0x8000, &payload);
+        let out = codec.decrypt_inbound(&frame).unwrap();
+
+        assert_eq!(out, indication(IO, &payload));
+        assert_eq!(codec.phase, Phase::Active);
+    }
+
+    #[test]
+    fn heartbeat_during_licensing_does_not_end_licensing() {
+        let mut codec = client();
+        codec.phase = Phase::Licensing;
+        let mut server = server_keys();
+
+        // SEC_HEARTBEAT
+        let heartbeat = encrypted_indication(&mut server, IO, 0x4000, &[1, 2, 3]);
+        codec.decrypt_inbound(&heartbeat).unwrap();
+
+        assert_eq!(codec.phase, Phase::Licensing);
+    }
+
+    #[test]
+    fn header_bearing_autodetect_on_io_channel_is_rejected_during_licensing() {
+        let mut codec = client();
+        codec.phase = Phase::Licensing;
+
+        let err = codec
+            .encrypt_outbound(&request(IO, &[raw_header(0x2000), vec![4, 5, 6]].concat()))
+            .unwrap_err();
+
+        assert!(
+            format!("{err:?}").contains("legacy security: unexpected outbound PDU in phase Licensing"),
+            "{err:?}"
+        );
     }
 
     #[test]

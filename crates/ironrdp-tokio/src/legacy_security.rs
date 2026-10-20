@@ -149,6 +149,10 @@ impl<S: AsyncRead + Unpin> AsyncRead for LegacySecurityStream<S> {
     fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
         let this = &mut *self;
 
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
+
         loop {
             if this.plain_pos < this.plain_in.len() {
                 let available = &this.plain_in[this.plain_pos..];
@@ -496,9 +500,7 @@ mod tests {
 
         let frame = info_frame(&[0xEE; 30]);
         stream.inner.fail_next = true;
-        if stream.write_all(&frame).await.is_err() {
-            stream.write_all(&frame).await.unwrap();
-        }
+        stream.write_all(&frame).await.unwrap();
         stream.flush().await.unwrap();
 
         let wire = read_exactly(&mut server, frame.len() + SIGNATURE_SIZE).await;
@@ -510,6 +512,18 @@ mod tests {
             Pin::new(&mut server).poll_read(&mut cx, &mut probe_buf).is_pending(),
             "the frame was written twice"
         );
+    }
+
+    #[tokio::test]
+    async fn zero_capacity_read_is_ready_without_reading_the_inner_stream() {
+        let (mut stream, _server) = pair(armed_handle());
+        let mut empty: [u8; 0] = [];
+        let mut buf = ReadBuf::new(&mut empty);
+        let mut cx = Context::from_waker(Waker::noop());
+
+        let poll = Pin::new(&mut stream).poll_read(&mut cx, &mut buf);
+
+        assert!(matches!(poll, Poll::Ready(Ok(()))), "{poll:?}");
     }
 
     #[tokio::test]

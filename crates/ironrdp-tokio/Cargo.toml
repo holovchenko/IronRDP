@@ -13,7 +13,8 @@ keywords.workspace = true
 categories.workspace = true
 
 # TESSERA PATCH (see rdp/ironrdp-fork.md in Tessera): `test = false` removed, `ironrdp-connector`
-# and `ironrdp-pdu` are mandatory dependencies for `LegacySecurityStream`.
+# and `ironrdp-pdu` are mandatory dependencies for `LegacySecurityStream` (so the `reqwest` feature
+# no longer lists `dep:ironrdp-connector`), and `[dev-dependencies]` are new for its tests.
 [lib]
 doctest = false
 
