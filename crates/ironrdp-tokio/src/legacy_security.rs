@@ -27,6 +27,8 @@ pub struct LegacySecurityStream<S> {
     /// Decoded bytes ready to be served to the reader, from `plain_pos`.
     plain_in: Vec<u8>,
     plain_pos: usize,
+    /// Error from a frame that followed already-converted ones, returned once those are served.
+    deferred_error: Option<io::Error>,
     eof: bool,
     /// Bytes accepted from the writer that do not yet form a whole frame.
     plain_out: Vec<u8>,
@@ -55,6 +57,7 @@ impl<S> LegacySecurityStream<S> {
             raw_in: Vec::new(),
             plain_in: Vec::new(),
             plain_pos: 0,
+            deferred_error: None,
             eof: false,
             plain_out: Vec::new(),
             wire_out: Vec::new(),
@@ -104,12 +107,21 @@ impl<S> LegacySecurityStream<S> {
             self.plain_in.clear();
             self.plain_pos = 0;
         }
-        Self::convert(
+        let converted_before = self.plain_in.len();
+        let result = Self::convert(
             &self.handle,
             &mut self.raw_in,
             &mut self.plain_in,
             LegacySecurityHandle::decrypt_inbound,
-        )
+        );
+        match result {
+            // Frames decoded before the bad one are valid data: serve them first, fail on the next read.
+            Err(error) if self.plain_in.len() > converted_before => {
+                self.deferred_error = Some(error);
+                Ok(())
+            }
+            other => other,
+        }
     }
 
     fn convert_outbound(&mut self) -> io::Result<()> {
@@ -160,6 +172,10 @@ impl<S: AsyncRead + Unpin> AsyncRead for LegacySecurityStream<S> {
                 buf.put_slice(&available[..n]);
                 this.plain_pos += n;
                 return Poll::Ready(Ok(()));
+            }
+
+            if let Some(error) = this.deferred_error.take() {
+                return Poll::Ready(Err(error));
             }
 
             this.convert_inbound()?;
@@ -227,7 +243,7 @@ mod tests {
 
     use ironrdp_connector::legacy_security::{LegacySecurityCodec, SessionKeys, mac};
     use ironrdp_core::{decode, encode_vec};
-    use ironrdp_pdu::gcc::EncryptionMethod;
+    use ironrdp_pdu::gcc::{EncryptionLevel, EncryptionMethod};
     use ironrdp_pdu::mcs::{SendDataIndication, SendDataRequest};
     use ironrdp_pdu::x224::X224;
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _, DuplexStream, duplex};
@@ -260,7 +276,7 @@ mod tests {
 
     fn armed_handle() -> LegacySecurityHandle {
         let handle = LegacySecurityHandle::default();
-        handle.arm(LegacySecurityCodec::new(keys(), IO, None));
+        handle.arm(LegacySecurityCodec::new(keys(), IO, None, EncryptionLevel::Low));
         handle
     }
 
@@ -455,6 +471,23 @@ mod tests {
         sealed[last] ^= 0xFF;
         server.write_all(&sealed).await.unwrap();
 
+        let error = stream.read(&mut [0; 64]).await.unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn valid_frame_before_a_malformed_one_is_served_before_the_error() {
+        let (mut stream, mut server) = pair(armed_handle());
+        let mut server_keys = server_keys();
+        let good = server_seal_indication(&mut server_keys, &[7; 16]);
+        let mut bad = server_seal_indication(&mut server_keys, &[5; 16]);
+        let last = bad.len() - 1;
+        bad[last] ^= 0xFF;
+        server.write_all(&[good, bad].concat()).await.unwrap();
+
+        let plain = indication(&[7; 16]);
+        assert_eq!(read_exactly(&mut stream, plain.len()).await, plain);
         let error = stream.read(&mut [0; 64]).await.unwrap_err();
 
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);

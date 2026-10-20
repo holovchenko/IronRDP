@@ -14,7 +14,10 @@ const SERVER_ENCRYPTION_LEVEL_SIZE: usize = 4;
 const SERVER_RANDOM_LEN_SIZE: usize = 4;
 const SERVER_CERT_LEN_SIZE: usize = 4;
 const SERVER_RANDOM_LEN: usize = 0x20;
-const MAX_SERVER_CERT_LEN: usize = 1024;
+// TESSERA PATCH (see rdp/ironrdp-fork.md in Tessera): was 1024, which rejected the several-KiB X.509 certificate
+// chain a Windows server sends in legacy mode. The whole GCC user data block length is a u16, so the certificate
+// can never legitimately exceed that; it stays a hostile-input cap.
+const MAX_SERVER_CERT_LEN: usize = 0xFFFF;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
@@ -228,7 +231,7 @@ impl EncryptionLevel {
 
 #[cfg(test)]
 mod tests {
-    use ironrdp_core::encode_vec;
+    use ironrdp_core::{decode, encode_vec};
 
     use super::*;
 
@@ -237,5 +240,33 @@ mod tests {
         let encoded = encode_vec(&ClientSecurityData::rc4()).unwrap();
 
         assert_eq!(encoded, [0x0B, 0, 0, 0, 0, 0, 0, 0]);
+    }
+
+    fn server_security_with_cert(cert_len: usize) -> Vec<u8> {
+        let data = ServerSecurityData {
+            encryption_method: EncryptionMethod::BIT_128,
+            encryption_level: EncryptionLevel::ClientCompatible,
+            server_random: Some([0x42; SERVER_RANDOM_LEN]),
+            server_cert: vec![0x30; cert_len],
+        };
+
+        encode_vec(&data).unwrap()
+    }
+
+    #[test]
+    fn server_security_data_accepts_multi_kib_certificate_chain() {
+        // The server-license fixture chain (CERT_1 + CERT_2) is 757 + 1277 = 2034 bytes.
+        let encoded = server_security_with_cert(2034);
+
+        let decoded = decode::<ServerSecurityData>(&encoded).unwrap();
+
+        assert_eq!(decoded.server_cert.len(), 2034);
+    }
+
+    #[test]
+    fn server_security_data_rejects_certificate_above_cap() {
+        let encoded = server_security_with_cert(MAX_SERVER_CERT_LEN + 1);
+
+        assert!(decode::<ServerSecurityData>(&encoded).is_err());
     }
 }

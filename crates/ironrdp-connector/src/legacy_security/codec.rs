@@ -1,6 +1,7 @@
 use core::fmt;
 use std::sync::{Arc, Mutex, PoisonError};
 
+use ironrdp_pdu::gcc::EncryptionLevel;
 use ironrdp_pdu::rdp::headers::BasicSecurityHeaderFlags;
 
 use super::{Cipher, SessionKeys, mac, salted_mac};
@@ -29,7 +30,8 @@ const CRYPTO_FLAGS: BasicSecurityHeaderFlags = BasicSecurityHeaderFlags::ENCRYPT
 /// PDUs the server may interleave into licensing; any other PDU on the I/O channel means Active.
 const LICENSING_PHASE_FLAGS: BasicSecurityHeaderFlags = BasicSecurityHeaderFlags::LICENSE_PKT
     .union(BasicSecurityHeaderFlags::AUTODETECT_REQ)
-    .union(BasicSecurityHeaderFlags::HEARTBEAT);
+    .union(BasicSecurityHeaderFlags::HEARTBEAT)
+    .union(BasicSecurityHeaderFlags::TRANSPORT_REQ);
 
 fn remaining_flags(flags: BasicSecurityHeaderFlags) -> BasicSecurityHeaderFlags {
     flags.difference(CRYPTO_FLAGS)
@@ -67,6 +69,8 @@ pub struct LegacySecurityCodec {
     message_channel_id: Option<u16>,
     phase: Phase,
     license_encrypt: bool,
+    // MS-RDPBCGR 5.3.1: only ENCRYPTION_LEVEL_LOW leaves server-to-client traffic unencrypted.
+    require_inbound_encryption: bool,
 }
 
 impl fmt::Debug for LegacySecurityCodec {
@@ -78,7 +82,12 @@ impl fmt::Debug for LegacySecurityCodec {
 }
 
 impl LegacySecurityCodec {
-    pub fn new(keys: SessionKeys, io_channel_id: u16, message_channel_id: Option<u16>) -> Self {
+    pub fn new(
+        keys: SessionKeys,
+        io_channel_id: u16,
+        message_channel_id: Option<u16>,
+        encryption_level: EncryptionLevel,
+    ) -> Self {
         Self {
             mac_key: keys.mac_key,
             encrypt: keys.encrypt,
@@ -88,6 +97,7 @@ impl LegacySecurityCodec {
             message_channel_id,
             phase: Phase::SecurityExchange,
             license_encrypt: false,
+            require_inbound_encryption: encryption_level != EncryptionLevel::Low,
         }
     }
 
@@ -114,7 +124,8 @@ impl LegacySecurityCodec {
 
         let (flags, body) = split_security_header(slow.user_data)?;
 
-        let plaintext = if flags.contains(BasicSecurityHeaderFlags::ENCRYPT) {
+        let encrypted = flags.contains(BasicSecurityHeaderFlags::ENCRYPT);
+        let plaintext = if encrypted {
             let (signature, ciphertext) = body
                 .split_at_checked(SIGNATURE_SIZE)
                 .ok_or_else(|| ConnectorError::reason("legacy security", "encrypted PDU is too short"))?;
@@ -134,6 +145,13 @@ impl LegacySecurityCodec {
             && !flags.intersects(LICENSING_PHASE_FLAGS)
         {
             self.phase = Phase::Active;
+        }
+
+        if !encrypted && self.phase == Phase::Active && self.require_inbound_encryption {
+            return Err(ConnectorError::reason(
+                "legacy security",
+                "unencrypted PDU received while encryption is required",
+            ));
         }
 
         if flags.contains(BasicSecurityHeaderFlags::LICENSE_PKT | BasicSecurityHeaderFlags::LICENSE_ENCRYPT_CS) {
@@ -207,6 +225,12 @@ impl LegacySecurityCodec {
         let fast = FastPath::parse(frame)?;
 
         if fast.header & FAST_PATH_ENCRYPTED == 0 {
+            if self.require_inbound_encryption {
+                return Err(ConnectorError::reason(
+                    "legacy security",
+                    "unencrypted fast-path PDU received while encryption is required",
+                ));
+            }
             return Ok(frame.to_vec());
         }
 
@@ -520,7 +544,11 @@ mod tests {
     }
 
     fn client() -> LegacySecurityCodec {
-        LegacySecurityCodec::new(keys(), IO, Some(MSG))
+        client_at(EncryptionLevel::Low)
+    }
+
+    fn client_at(level: EncryptionLevel) -> LegacySecurityCodec {
+        LegacySecurityCodec::new(keys(), IO, Some(MSG), level)
     }
 
     fn header(flags: BasicSecurityHeaderFlags) -> Vec<u8> {
@@ -974,5 +1002,68 @@ mod tests {
         assert!(handle.is_armed());
         assert!(format!("{handle:?}").contains("armed: true"));
         assert!(handle.encrypt_outbound(&frame).is_err());
+    }
+
+    #[test]
+    fn transport_request_during_licensing_does_not_end_licensing() {
+        let mut codec = client();
+        codec.phase = Phase::Licensing;
+        let mut server = server_keys();
+
+        // SEC_TRANSPORT_REQ, MS-RDPBCGR 2.2.8.1.1.2.1
+        let transport_request = encrypted_indication(&mut server, IO, 0x0002, &[1, 2, 3]);
+        codec.decrypt_inbound(&transport_request).unwrap();
+
+        assert_eq!(codec.phase, Phase::Licensing);
+    }
+
+    #[test]
+    fn unencrypted_active_slow_path_is_rejected_above_low_and_passes_at_low() {
+        let frame = indication(IO, &[0, 0, 0, 0, 9]);
+
+        for level in [EncryptionLevel::ClientCompatible, EncryptionLevel::High] {
+            let mut codec = client_at(level);
+            codec.phase = Phase::Active;
+
+            let err = codec.decrypt_inbound(&frame).unwrap_err();
+
+            assert!(format!("{err:?}").contains("unencrypted PDU received"), "{err:?}");
+        }
+
+        let mut codec = client_at(EncryptionLevel::Low);
+        codec.phase = Phase::Active;
+        assert_eq!(codec.decrypt_inbound(&frame).unwrap(), indication(IO, &[9]));
+    }
+
+    #[test]
+    fn unencrypted_demand_active_ending_licensing_is_rejected_at_high() {
+        let mut codec = client_at(EncryptionLevel::High);
+        codec.phase = Phase::Licensing;
+
+        assert!(codec.decrypt_inbound(&indication(IO, &[0, 0, 0, 0, 9])).is_err());
+    }
+
+    #[test]
+    fn unencrypted_licensing_pdu_passes_at_high() {
+        let mut codec = client_at(EncryptionLevel::High);
+        codec.phase = Phase::Licensing;
+        let frame = indication(IO, &[header(BasicSecurityHeaderFlags::LICENSE_PKT), vec![7]].concat());
+
+        assert!(codec.decrypt_inbound(&frame).is_ok());
+        assert_eq!(codec.phase, Phase::Licensing);
+    }
+
+    #[test]
+    fn unencrypted_fast_path_is_rejected_above_low_and_passes_at_low() {
+        let frame = [0x00, 0x05, 1, 2, 3];
+
+        let mut high = client_at(EncryptionLevel::High);
+        high.phase = Phase::Active;
+        let err = high.decrypt_inbound(&frame).unwrap_err();
+        assert!(format!("{err:?}").contains("unencrypted fast-path PDU"), "{err:?}");
+
+        let mut low = client_at(EncryptionLevel::Low);
+        low.phase = Phase::Active;
+        assert_eq!(low.decrypt_inbound(&frame).unwrap(), frame);
     }
 }

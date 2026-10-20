@@ -373,6 +373,7 @@ pub struct ClientConnector {
 #[derive(Debug)]
 struct LegacySecurityParams {
     method: gcc::EncryptionMethod,
+    level: gcc::EncryptionLevel,
     server_random: [u8; 32],
     public_key_der: Vec<u8>,
 }
@@ -520,6 +521,7 @@ impl ClientConnector {
 
         Ok(Some(LegacySecurityParams {
             method: security.encryption_method,
+            level: security.encryption_level,
             server_random,
             public_key_der: server_public_key(&certificate)?,
         }))
@@ -1433,7 +1435,12 @@ impl Sequence for ClientConnector {
 
                 let encrypted_client_random = encrypt_client_random(&client_random, &params.public_key_der)?;
                 let keys = SessionKeys::derive(&client_random, &params.server_random, params.method)?;
-                handle.arm(LegacySecurityCodec::new(keys, io_channel_id, self.message_channel_id));
+                handle.arm(LegacySecurityCodec::new(
+                    keys,
+                    io_channel_id,
+                    self.message_channel_id,
+                    params.level,
+                ));
 
                 let pdu = SecurityExchangePdu {
                     encrypted_client_random,

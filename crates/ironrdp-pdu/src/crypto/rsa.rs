@@ -11,6 +11,10 @@ const MIN_MODULUS_BITS: u64 = 256;
 /// cost grows with the modulus size.
 const MAX_MODULUS_BITS: u64 = 16384;
 
+/// Largest accepted public exponent. Real keys use 65537 or 3 (the proprietary certificate format stores a u32);
+/// an exponent as wide as the modulus would cost seconds of `modpow` before authentication.
+const MAX_EXPONENT_BITS: u64 = 64;
+
 // TESSERA PATCH (see rdp/ironrdp-fork.md in Tessera): visibility widened from `pub(crate)` for the connector's Security Exchange.
 pub fn encrypt_with_public_key(message: &[u8], public_key_der: &[u8]) -> io::Result<Vec<u8>> {
     let (_, der_object) = parse_der(public_key_der).map_err(|err| {
@@ -51,8 +55,9 @@ pub fn encrypt_with_public_key(message: &[u8], public_key_der: &[u8]) -> io::Res
     let n = BigUint::from_bytes_be(n);
     let e = BigUint::from_bytes_be(e);
     // TESSERA PATCH (see rdp/ironrdp-fork.md in Tessera): the key reaches here before authentication.
-    // A zero modulus would panic in `modpow`, an oversized one is a CPU-exhaustion vector, and a
-    // message that does not fit (`m >= n`) would be silently reduced, so the server would derive other keys.
+    // A zero modulus would panic in `modpow`, and a message that does not fit (`m >= n`) would be silently
+    // reduced, so the server would derive other keys. The modulus and exponent widths are capped because
+    // `modpow` cost grows with both: that bounds the CPU a hostile server can burn, it does not remove it.
     if n.bits() < MIN_MODULUS_BITS {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -69,6 +74,19 @@ pub fn encrypt_with_public_key(message: &[u8], public_key_der: &[u8]) -> io::Res
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "public key exponent is zero",
+        ));
+    }
+    if e.bits() > MAX_EXPONENT_BITS {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("public key exponent is too long: {} bits", e.bits()),
+        ));
+    }
+    // An exponent of 1 would send the client random in cleartext; an even one is not a valid RSA exponent.
+    if e < BigUint::from(3u8) || !e.bit(0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "public key exponent is not an odd number >= 3",
         ));
     }
     let m = BigUint::from_bytes_le(message);
@@ -183,14 +201,48 @@ mod tests {
 
     #[test]
     fn output_keeps_modulus_width_plus_eight_when_ciphertext_has_zero_high_byte() {
-        // Exponent 1 makes the ciphertext equal to the message, so its high-order bytes are zero.
+        // Message 1 stays 1 under any exponent, so the ciphertext's high-order bytes are zero.
+        let modulus = [&[0x00u8][..], &[0xFF; 32]].concat();
+        let der = public_key_der(&modulus, &[0x01, 0x00, 0x01]);
+
+        let out = encrypt_with_public_key(&[1], &der).unwrap();
+
+        assert_eq!(out.len(), 32 + 8);
+        assert_eq!(out[0], 1);
+        assert!(out[1..].iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn oversized_exponent_is_rejected() {
+        let modulus = [&[0x00u8][..], &[0xFF; 32]].concat();
+        let exponent = [&[0x01u8][..], &[0x00; 8]].concat(); // 65 bits
+        let der = public_key_der(&modulus, &exponent);
+
+        let err = encrypt_with_public_key(&[0x11; 32], &der).unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("too long"), "{err}");
+    }
+
+    #[test]
+    fn exponent_one_is_rejected() {
         let modulus = [&[0x00u8][..], &[0xFF; 32]].concat();
         let der = public_key_der(&modulus, &[0x01]);
 
-        let out = encrypt_with_public_key(&[1, 2, 3], &der).unwrap();
+        let err = encrypt_with_public_key(&[0x11; 32], &der).unwrap_err();
 
-        assert_eq!(out.len(), 32 + 8);
-        assert_eq!(out[..3], [1, 2, 3]);
-        assert!(out[3..].iter().all(|byte| *byte == 0));
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("odd number"), "{err}");
+    }
+
+    #[test]
+    fn even_exponent_is_rejected() {
+        let modulus = [&[0x00u8][..], &[0xFF; 32]].concat();
+        let der = public_key_der(&modulus, &[0x04]);
+
+        let err = encrypt_with_public_key(&[0x11; 32], &der).unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("odd number"), "{err}");
     }
 }
