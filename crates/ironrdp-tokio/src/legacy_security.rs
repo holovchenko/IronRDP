@@ -19,7 +19,6 @@ const READ_CHUNK_SIZE: usize = 8 * 1024;
 /// Arming is decided per frame at the moment it is processed: bytes are never decrypted
 /// retroactively. The caller must therefore arm at a frame boundary, i.e. before the first
 /// protected frame is read from the stream or written to it.
-#[derive(Debug)]
 pub struct LegacySecurityStream<S> {
     inner: S,
     handle: LegacySecurityHandle,
@@ -34,6 +33,18 @@ pub struct LegacySecurityStream<S> {
     /// Encoded bytes waiting to be written to `inner`, from `wire_pos`.
     wire_out: Vec<u8>,
     wire_pos: usize,
+}
+
+impl<S> core::fmt::Debug for LegacySecurityStream<S> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("LegacySecurityStream")
+            .field("armed", &self.handle.is_armed())
+            .field("raw_in_len", &self.raw_in.len())
+            .field("plain_in_len", &self.plain_in.len())
+            .field("plain_out_len", &self.plain_out.len())
+            .field("wire_out_len", &self.wire_out.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl<S> LegacySecurityStream<S> {
@@ -303,6 +314,24 @@ mod tests {
     }
 
     fn assert_send_sync<T: Send + Sync>() {}
+
+    #[test]
+    fn debug_output_shows_lengths_never_buffer_contents() {
+        let (client, _server) = duplex(64);
+        let mut stream = LegacySecurityStream::new(client, armed_handle());
+        stream.raw_in = vec![0xA1, 0xA2, 0xA3];
+        stream.plain_in = b"hunter2-secret".to_vec();
+        stream.plain_out = b"password-bytes".to_vec();
+        stream.wire_out = vec![0xB1, 0xB2];
+
+        let dump = format!("{stream:?}");
+
+        assert!(dump.contains("armed: true"), "{dump}");
+        assert!(dump.contains("plain_in_len: 14"), "{dump}");
+        for leaked in ["hunter2", "password", "161", "177", "104", "[", "]"] {
+            assert!(!dump.contains(leaked), "{leaked} leaked in {dump}");
+        }
+    }
 
     #[test]
     fn stream_is_send_and_sync() {

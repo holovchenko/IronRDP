@@ -483,7 +483,9 @@ impl ClientConnector {
 
     /// Validates the server's SC_SECURITY block against what a standard-security client supports.
     ///
-    /// Returns `None` for `ENCRYPTION_LEVEL_NONE`, which needs no Security Exchange.
+    /// Returns `None` for `ENCRYPTION_LEVEL_NONE` when no legacy handle is configured (named-pipe
+    /// transports), which needs no Security Exchange. With a handle the client offered RC4, so a
+    /// server selecting no encryption is rejected instead of silently sending data in cleartext.
     fn legacy_security_params_from(
         &self,
         security: &gcc::ServerSecurityData,
@@ -491,6 +493,12 @@ impl ClientConnector {
         use gcc::{EncryptionLevel, EncryptionMethod};
 
         if security.encryption_level == EncryptionLevel::None {
+            if self.config.legacy_security.is_some() {
+                return Err(reason_err!(
+                    "Initiation",
+                    "server selected no encryption for legacy RDP security"
+                ));
+            }
             return Ok(None);
         }
         if security.encryption_level == EncryptionLevel::Fips
@@ -2920,13 +2928,32 @@ mod tests {
         }
 
         #[test]
-        fn encryption_level_none_keeps_existing_path() {
-            let handle = LegacySecurityHandle::default();
-            let mut connector = connector_waiting_for_server_gcc(legacy_config(Some(handle.clone())));
+        fn encryption_level_none_without_handle_keeps_existing_path() {
+            let mut connector = connector_waiting_for_server_gcc(legacy_config(None));
 
             run_to_end_of_channel_connection(&mut connector, gcc::ServerSecurityData::no_security());
 
             assert_eq!(connector.state.name(), "SecureSettingsExchange");
+        }
+
+        #[test]
+        fn encryption_level_none_with_handle_is_rejected() {
+            let handle = LegacySecurityHandle::default();
+            let mut connector = connector_waiting_for_server_gcc(legacy_config(Some(handle.clone())));
+            let mut output = WriteBuf::new();
+
+            let err = connector
+                .step(
+                    &connect_response(gcc::ServerSecurityData::no_security()),
+                    None,
+                    &mut output,
+                )
+                .unwrap_err();
+
+            assert!(
+                format!("{err:?}").contains("server selected no encryption for legacy RDP security"),
+                "{err:?}"
+            );
             assert!(!handle.is_armed());
         }
     }
