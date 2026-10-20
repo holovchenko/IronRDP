@@ -1,5 +1,6 @@
 use core::{fmt, ops};
 
+// TESSERA PATCH (see rdp/ironrdp-fork.md in Tessera): widened from `pub(crate)` for legacy RDP security.
 #[derive(Debug, Clone)]
 pub struct Rc4 {
     i: usize,
@@ -8,6 +9,7 @@ pub struct Rc4 {
 }
 
 impl Rc4 {
+    /// Creates a cipher from `key`, which must not be empty.
     pub fn new(key: &[u8]) -> Self {
         // key scheduling
         let mut state = State::default();

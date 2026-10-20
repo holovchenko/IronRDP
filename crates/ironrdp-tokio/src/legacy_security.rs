@@ -191,8 +191,10 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for LegacySecurityStream<S> {
 
         this.plain_out.extend_from_slice(buf);
         this.convert_outbound()?;
-        // Best effort: the bytes are accepted either way and `poll_flush` drains the rest.
-        let _ = this.poll_drain(cx)?;
+        // Best effort: the bytes are accepted either way and `poll_flush` drains the rest. Returning
+        // an error here would make a retrying caller duplicate the frame and advance RC4 twice; a
+        // persistent error resurfaces on the next `poll_write` or `poll_flush`.
+        let _ = this.poll_drain(cx);
 
         Poll::Ready(Ok(buf.len()))
     }
@@ -207,6 +209,10 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for LegacySecurityStream<S> {
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         ready!(self.as_mut().poll_flush(cx))?;
+        // A partial plaintext frame would be dropped silently; mirror `poll_read`'s `UnexpectedEof`.
+        if !self.plain_out.is_empty() {
+            return Poll::Ready(Err(io::ErrorKind::UnexpectedEof.into()));
+        }
         Pin::new(&mut self.inner).poll_shutdown(cx)
     }
 }
@@ -448,5 +454,72 @@ mod tests {
         let error = stream.read(&mut [0; 64]).await.unwrap_err();
 
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    /// Fails the next write with `Interrupted`, then behaves like the wrapped stream.
+    struct FailNextWrite<S> {
+        inner: S,
+        fail_next: bool,
+    }
+
+    impl<S: AsyncWrite + Unpin> AsyncWrite for FailNextWrite<S> {
+        fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+            if core::mem::take(&mut self.fail_next) {
+                return Poll::Ready(Err(io::ErrorKind::Interrupted.into()));
+            }
+            Pin::new(&mut self.inner).poll_write(cx, buf)
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
+    #[tokio::test]
+    async fn retried_write_after_inner_error_does_not_duplicate_the_frame() {
+        let (client, mut server) = duplex(64 * 1024);
+        let mut stream = LegacySecurityStream::new(
+            FailNextWrite {
+                inner: client,
+                fail_next: false,
+            },
+            armed_handle(),
+        );
+        let mut server_keys = server_keys();
+        stream.write_all(&exchange_frame()).await.unwrap();
+        stream.flush().await.unwrap();
+        read_exactly(&mut server, exchange_frame().len()).await;
+
+        let frame = info_frame(&[0xEE; 30]);
+        stream.inner.fail_next = true;
+        if stream.write_all(&frame).await.is_err() {
+            stream.write_all(&frame).await.unwrap();
+        }
+        stream.flush().await.unwrap();
+
+        let wire = read_exactly(&mut server, frame.len() + SIGNATURE_SIZE).await;
+        assert_eq!(server_open_request(&mut server_keys, &wire), [0xEE; 30]);
+        let mut probe = [0; 1];
+        let mut probe_buf = ReadBuf::new(&mut probe);
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(
+            Pin::new(&mut server).poll_read(&mut cx, &mut probe_buf).is_pending(),
+            "the frame was written twice"
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_with_partial_frame_is_an_error() {
+        let (mut stream, _server) = pair(armed_handle());
+        let frame = exchange_frame();
+        stream.write_all(&frame[..5]).await.unwrap();
+
+        let error = stream.shutdown().await.unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
     }
 }

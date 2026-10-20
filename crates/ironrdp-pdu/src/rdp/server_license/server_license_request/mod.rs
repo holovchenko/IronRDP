@@ -221,6 +221,7 @@ impl ServerCertificate {
 
         match &self.certificate {
             CertificateType::Proprietary(certificate) => {
+                // TESSERA PATCH (see rdp/ironrdp-fork.md in Tessera): upstream used the little-endian bytes as-is.
                 // The proprietary certificate stores the modulus little-endian, DER wants big-endian.
                 let public_exponent = certificate.public_key.public_exponent.to_be_bytes();
                 let mut modulus = certificate.public_key.modulus.clone();

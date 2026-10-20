@@ -26,6 +26,7 @@ pub mod x224;
 
 pub(crate) mod basic_output;
 pub(crate) mod ber;
+// TESSERA PATCH (see rdp/ironrdp-fork.md in Tessera): widened from `pub(crate)` for legacy RDP security.
 pub mod crypto;
 pub(crate) mod per;
 

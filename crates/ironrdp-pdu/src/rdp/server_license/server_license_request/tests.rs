@@ -532,6 +532,28 @@ fn get_public_key_correctly_gets_key_from_server_certificate() {
 }
 
 #[test]
+fn get_public_key_of_proprietary_certificate_is_big_endian_der() {
+    let certificate = ServerCertificate {
+        issued_permanently: true,
+        certificate: CertificateType::Proprietary(ProprietaryCertificate {
+            public_key: RsaPublicKey {
+                public_exponent: 65537,
+                // Proprietary certificates store the modulus little-endian.
+                modulus: (1..=32).collect(),
+            },
+            signature: vec![0; 8],
+        }),
+    };
+
+    let der = certificate.get_public_key().unwrap();
+
+    let mut expected = vec![0x30, 0x27, 0x02, 0x20];
+    expected.extend((1..=32u8).rev());
+    expected.extend_from_slice(&[0x02, 0x03, 0x01, 0x00, 0x01]);
+    assert_eq!(der, expected);
+}
+
+#[test]
 fn from_buffer_correctly_parses_server_certificate() {
     let certificate_buffer = [
         &SERVER_CERTIFICATE_HEADER_BUFFER[..],

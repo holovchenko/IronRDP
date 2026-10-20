@@ -23,6 +23,10 @@ const CRYPTO_FLAGS: BasicSecurityHeaderFlags = BasicSecurityHeaderFlags::ENCRYPT
     .union(BasicSecurityHeaderFlags::RESET_SEQNO)
     .union(BasicSecurityHeaderFlags::IGNORE_SEQNO);
 
+fn remaining_flags(flags: BasicSecurityHeaderFlags) -> BasicSecurityHeaderFlags {
+    flags.difference(CRYPTO_FLAGS)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Phase {
     SecurityExchange,
@@ -115,9 +119,9 @@ impl LegacySecurityCodec {
             body.to_vec()
         };
 
-        if slow.channel_id == self.io_channel_id
-            && self.phase == Phase::Licensing
-            && !flags.contains(BasicSecurityHeaderFlags::LICENSE_PKT)
+        // Only a header with nothing but crypto flags is Active data: Windows interleaves other PDUs
+        // (e.g. an Auto-Detect Request, SEC_AUTODETECT_REQ) into licensing.
+        if slow.channel_id == self.io_channel_id && self.phase == Phase::Licensing && remaining_flags(flags).is_empty()
         {
             self.phase = Phase::Active;
         }
@@ -126,7 +130,7 @@ impl LegacySecurityCodec {
             self.license_encrypt = true;
         }
 
-        let remaining = flags.difference(CRYPTO_FLAGS);
+        let remaining = remaining_flags(flags);
         let mut user_data = Vec::with_capacity(SECURITY_HEADER_SIZE + plaintext.len());
         if !remaining.is_empty() {
             user_data.extend_from_slice(&security_header(remaining));
@@ -408,6 +412,9 @@ fn build_fast_path(header: u8, payload: &[u8]) -> ConnectorResult<Vec<u8>> {
 }
 
 /// Frame codec shared between the connector and the transport stream; passes frames through until armed.
+///
+/// A handle serves exactly one connection attempt: it stays armed after the connection ends, so a
+/// new attempt needs a new handle (reusing one would encrypt its unprotected handshake frames).
 #[derive(Clone, Default)]
 pub struct LegacySecurityHandle {
     inner: Arc<Mutex<Option<LegacySecurityCodec>>>,
@@ -729,6 +736,43 @@ mod tests {
 
             assert_eq!(out, indication(IO, &payload));
         }
+    }
+
+    #[test]
+    fn autodetect_request_during_licensing_does_not_end_licensing() {
+        let reply = request(
+            IO,
+            &[header(BasicSecurityHeaderFlags::LICENSE_PKT), vec![8; 10]].concat(),
+        );
+        let mut codec = client();
+        codec.phase = Phase::Licensing;
+        let mut server = server_keys();
+
+        // SEC_AUTODETECT_REQ, MS-RDPBCGR 2.2.8.1.1.2.1
+        let autodetect = encrypted_indication(&mut server, IO, 0x1000, &[1, 2, 3]);
+        codec.decrypt_inbound(&autodetect).unwrap();
+
+        assert_eq!(codec.phase, Phase::Licensing);
+        assert_eq!(codec.encrypt_outbound(&reply).unwrap(), reply);
+    }
+
+    #[test]
+    fn inbound_salted_checksum_count_survives_key_update() {
+        let mut codec = client();
+        let mut server = server_keys();
+        let total = 4096 + 5;
+        for count in 0..total {
+            let payload = vec![0x5A; 12];
+            // SEC_ENCRYPT | SEC_SECURE_CHECKSUM
+            let user_data = [raw_header(0x0808), server_seal(&mut server, &payload, Some(count))].concat();
+
+            let out = codec.decrypt_inbound(&indication(IO, &user_data)).unwrap();
+
+            assert_eq!(out, indication(IO, &payload), "packet {count}");
+        }
+
+        assert_eq!(codec.decrypt_count, total);
+        assert_eq!(codec.decrypt.use_count(), 5);
     }
 
     #[test]

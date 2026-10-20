@@ -8,6 +8,7 @@ mod connection;
 pub mod connection_activation;
 mod connection_finalization;
 pub mod credssp;
+// TESSERA PATCH (see rdp/ironrdp-fork.md in Tessera): Standard RDP Security (RC4).
 pub mod legacy_security;
 mod license_exchange;
 mod server_name;
@@ -210,6 +211,7 @@ pub struct Config {
     /// Defaults should stay `false`. Enable this only for known-local paths or an explicit opt-in to
     /// legacy security.
     pub enable_standard_rdp_security: bool,
+    // TESSERA PATCH (see rdp/ironrdp-fork.md in Tessera): legacy RDP security hook.
     /// Receives the RC4 session keys when the server requires Standard RDP Security with encryption.
     ///
     /// The connector arms this handle while performing the Security Exchange; the transport layer

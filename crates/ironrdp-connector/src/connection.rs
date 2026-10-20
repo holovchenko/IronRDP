@@ -1931,6 +1931,7 @@ fn create_gcc_blocks<'a>(
                 },
             },
         },
+        // TESSERA PATCH (see rdp/ironrdp-fork.md in Tessera): offer RC4 when a legacy security handle is set.
         security: if config.enable_standard_rdp_security
             && config.legacy_security.is_some()
             && selected_protocol.is_standard_rdp_security()
