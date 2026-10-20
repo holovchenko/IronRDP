@@ -1923,7 +1923,10 @@ fn create_gcc_blocks<'a>(
                 },
             },
         },
-        security: if config.enable_standard_rdp_security && selected_protocol.is_standard_rdp_security() {
+        security: if config.enable_standard_rdp_security
+            && config.legacy_security.is_some()
+            && selected_protocol.is_standard_rdp_security()
+        {
             ClientSecurityData::rc4()
         } else {
             ClientSecurityData::no_security()
@@ -2870,8 +2873,39 @@ mod tests {
         }
 
         #[test]
+        fn standard_security_without_handle_offers_no_encryption() {
+            let blocks = create_gcc_blocks(
+                &legacy_config(None),
+                None,
+                nego::SecurityProtocol::empty(),
+                true,
+                core::iter::empty(),
+            )
+            .expect("valid GCC blocks");
+
+            assert_eq!(blocks.security, gcc::ClientSecurityData::no_security());
+        }
+
+        #[test]
+        fn fips_method_at_a_non_fips_level_is_rejected() {
+            let mut connector = connector_waiting_for_server_gcc(legacy_config(Some(LegacySecurityHandle::default())));
+            let mut output = WriteBuf::new();
+
+            let err = connector
+                .step(
+                    &connect_response(server_security(EncryptionLevel::High, EncryptionMethod::FIPS)),
+                    None,
+                    &mut output,
+                )
+                .unwrap_err();
+
+            assert!(format!("{err:?}").contains("which Tessera does not support"), "{err:?}");
+        }
+
+        #[test]
         fn rc4_without_handle_is_an_error() {
-            let mut connector = connector_waiting_for_server_gcc(legacy_config(None));
+            let mut connector = connector_waiting_for_server_gcc(legacy_config(Some(LegacySecurityHandle::default())));
+            connector.config.legacy_security = None;
             let mut output = WriteBuf::new();
 
             let err = connector
