@@ -198,10 +198,10 @@ impl LegacySecurityCodec {
             .ok_or_else(|| ConnectorError::reason("legacy security", "encrypted fast-path PDU is too short"))?;
         let plaintext = self.open(signature, ciphertext, fast.header & FAST_PATH_SECURE_CHECKSUM != 0)?;
 
-        Ok(build_fast_path(
+        build_fast_path(
             fast.header & !(FAST_PATH_ENCRYPTED | FAST_PATH_SECURE_CHECKSUM),
             &plaintext,
-        ))
+        )
     }
 
     fn encrypt_fast_path(&mut self, frame: &[u8]) -> ConnectorResult<Vec<u8>> {
@@ -210,7 +210,7 @@ impl LegacySecurityCodec {
         let mut payload = Vec::with_capacity(SIGNATURE_SIZE + fast.payload.len());
         self.seal(fast.payload, &mut payload);
 
-        Ok(build_fast_path(fast.header | FAST_PATH_ENCRYPTED, &payload))
+        build_fast_path(fast.header | FAST_PATH_ENCRYPTED, &payload)
     }
 
     /// Decrypts `ciphertext` and checks it against `signature`.
@@ -390,9 +390,12 @@ impl<'a> FastPath<'a> {
     }
 }
 
-fn build_fast_path(header: u8, payload: &[u8]) -> Vec<u8> {
+fn build_fast_path(header: u8, payload: &[u8]) -> ConnectorResult<Vec<u8>> {
     // The length field counts the header byte and itself; it takes the short form whenever that fits in 7 bits.
     let short_total = 2 + payload.len();
+    if short_total + 1 > MAX_PER_LENGTH {
+        return Err(ConnectorError::reason("legacy security", "PDU is too large"));
+    }
     let mut out = Vec::with_capacity(3 + payload.len());
     out.push(header);
     if short_total <= 0x7F {
@@ -401,7 +404,7 @@ fn build_fast_path(header: u8, payload: &[u8]) -> Vec<u8> {
         out.extend_from_slice(&(u16::try_from(short_total + 1).unwrap_or(0x7FFF) | 0x8000).to_be_bytes());
     }
     out.extend_from_slice(payload);
-    out
+    Ok(out)
 }
 
 /// Frame codec shared between the connector and the transport stream; passes frames through until armed.
@@ -550,18 +553,14 @@ mod tests {
         plaintext
     }
 
-    fn encrypted_indication(
-        keys: &mut SessionKeys,
-        channel_id: u16,
-        flags: BasicSecurityHeaderFlags,
-        data: &[u8],
-    ) -> Vec<u8> {
-        let user_data = [
-            header(flags | BasicSecurityHeaderFlags::ENCRYPT),
-            server_seal(keys, data, None),
-        ]
-        .concat();
+    fn encrypted_indication(keys: &mut SessionKeys, channel_id: u16, flags: u16, data: &[u8]) -> Vec<u8> {
+        let user_data = [raw_header(flags | 0x0008), server_seal(keys, data, None)].concat();
         indication(channel_id, &user_data)
+    }
+
+    /// Header bytes built from a spec literal, independent of the `ironrdp-pdu` flag constants.
+    fn raw_header(flags: u16) -> Vec<u8> {
+        [flags.to_le_bytes().as_slice(), &[0, 0]].concat()
     }
 
     fn advance_to_active(codec: &mut LegacySecurityCodec) {
@@ -599,12 +598,7 @@ mod tests {
         let info = [header(BasicSecurityHeaderFlags::INFO_PKT), unhex(PLAINTEXT)].concat();
         let out = codec.encrypt_outbound(&request(IO, &info)).unwrap();
 
-        let expected = [
-            header(BasicSecurityHeaderFlags::INFO_PKT | BasicSecurityHeaderFlags::ENCRYPT),
-            unhex(MAC_128),
-            unhex(CIPHERTEXT_128),
-        ]
-        .concat();
+        let expected = [raw_header(0x0048), unhex(MAC_128), unhex(CIPHERTEXT_128)].concat();
         assert_eq!(user_data_of(&out), expected);
         assert_eq!(usize::from(u16::from_be_bytes([out[2], out[3]])), out.len());
     }
@@ -626,7 +620,7 @@ mod tests {
         let mut codec = client();
         let mut server = server_keys();
         let payload = vec![0x42; 200];
-        let frame = encrypted_indication(&mut server, IO, BasicSecurityHeaderFlags::empty(), &payload);
+        let frame = encrypted_indication(&mut server, IO, 0, &payload);
 
         let out = codec.decrypt_inbound(&frame).unwrap();
 
@@ -637,7 +631,7 @@ mod tests {
     fn inbound_license_pdu_keeps_license_header() {
         let mut codec = client();
         let mut server = server_keys();
-        let frame = encrypted_indication(&mut server, IO, BasicSecurityHeaderFlags::LICENSE_PKT, &[1, 2, 3]);
+        let frame = encrypted_indication(&mut server, IO, 0x0080, &[1, 2, 3]);
 
         let out = codec.decrypt_inbound(&frame).unwrap();
 
@@ -654,12 +648,11 @@ mod tests {
     fn inbound_autodetect_on_message_channel_keeps_header() {
         let mut codec = client();
         let mut server = server_keys();
-        let autodetect = BasicSecurityHeaderFlags::from_bits_retain(0x1000);
-        let frame = encrypted_indication(&mut server, MSG, autodetect, &[9, 9]);
+        let frame = encrypted_indication(&mut server, MSG, 0x1000, &[9, 9]);
 
         let out = codec.decrypt_inbound(&frame).unwrap();
 
-        assert_eq!(out, indication(MSG, &[header(autodetect), vec![9, 9]].concat()));
+        assert_eq!(out, indication(MSG, &[raw_header(0x1000), vec![9, 9]].concat()));
     }
 
     #[test]
@@ -669,14 +662,13 @@ mod tests {
         let mut server = server_keys();
         // The licensing walk above used the encrypt cipher once (Client Info), mirror that.
         server_open_info(&mut server);
-        let autodetect = BasicSecurityHeaderFlags::from_bits_retain(0x2000);
 
         let out = codec
-            .encrypt_outbound(&request(MSG, &[header(autodetect), vec![4, 5, 6]].concat()))
+            .encrypt_outbound(&request(MSG, &[raw_header(0x2000), vec![4, 5, 6]].concat()))
             .unwrap();
 
         let user_data = user_data_of(&out);
-        assert_eq!(user_data[..4], header(autodetect | BasicSecurityHeaderFlags::ENCRYPT));
+        assert_eq!(user_data[..4], raw_header(0x2008));
         assert_eq!(server_open(&mut server, &user_data[4..]), vec![4, 5, 6]);
     }
 
@@ -708,27 +700,61 @@ mod tests {
         let mut without = client();
         without.phase = Phase::Licensing;
         let mut server = server_keys();
-        let challenge = encrypted_indication(&mut server, IO, BasicSecurityHeaderFlags::LICENSE_PKT, &[1]);
+        let challenge = encrypted_indication(&mut server, IO, 0x0080, &[1]);
         without.decrypt_inbound(&challenge).unwrap();
         assert_eq!(without.encrypt_outbound(&reply).unwrap(), reply);
 
         let mut with = client();
         with.phase = Phase::Licensing;
         let mut server = server_keys();
-        let challenge = encrypted_indication(
-            &mut server,
-            IO,
-            BasicSecurityHeaderFlags::LICENSE_PKT | BasicSecurityHeaderFlags::LICENSE_ENCRYPT_CS,
-            &[1],
-        );
+        // SEC_LICENSE_PKT | SEC_LICENSE_ENCRYPT_CS, MS-RDPBCGR 2.2.8.1.1.2.1
+        let challenge = encrypted_indication(&mut server, IO, 0x0280, &[1]);
         with.decrypt_inbound(&challenge).unwrap();
         let out = with.encrypt_outbound(&reply).unwrap();
         let user_data = user_data_of(&out);
-        assert_eq!(
-            user_data[..4],
-            header(BasicSecurityHeaderFlags::LICENSE_PKT | BasicSecurityHeaderFlags::ENCRYPT)
-        );
+        assert_eq!(user_data[..4], raw_header(0x0088));
         assert_eq!(server_open(&mut server, &user_data[4..]), vec![8; 10]);
+    }
+
+    #[test]
+    fn inbound_slow_path_secure_checksum_uses_salted_mac() {
+        let mut codec = client();
+        let mut server = server_keys();
+        for count in 0..3u32 {
+            let payload = vec![u8::try_from(count).unwrap(); 12];
+            // SEC_ENCRYPT | SEC_SECURE_CHECKSUM
+            let user_data = [raw_header(0x0808), server_seal(&mut server, &payload, Some(count))].concat();
+
+            let out = codec.decrypt_inbound(&indication(IO, &user_data)).unwrap();
+
+            assert_eq!(out, indication(IO, &payload));
+        }
+    }
+
+    #[test]
+    fn outbound_on_message_channel_is_headed_and_encrypted_during_licensing() {
+        let mut codec = client();
+        codec.phase = Phase::Licensing;
+        let mut server = server_keys();
+
+        let out = codec
+            .encrypt_outbound(&request(MSG, &[raw_header(0x2000), vec![3, 3]].concat()))
+            .unwrap();
+
+        let user_data = user_data_of(&out);
+        assert_eq!(user_data[..4], raw_header(0x2008));
+        assert_eq!(server_open(&mut server, &user_data[4..]), vec![3, 3]);
+        assert_eq!(codec.phase, Phase::Licensing);
+    }
+
+    #[test]
+    fn oversized_outbound_fast_path_is_an_error() {
+        let mut codec = client();
+        // Largest frame the 2-byte length form can describe; encryption adds the signature on top.
+        let mut frame = vec![0x00, 0xFF, 0xFF];
+        frame.resize(0x7FFF, 0);
+
+        assert!(codec.encrypt_outbound(&frame).is_err());
     }
 
     #[test]
@@ -738,7 +764,7 @@ mod tests {
             let mut server = server_keys();
             let payload = vec![0x33; payload_len];
             let sealed = server_seal(&mut server, &payload, None);
-            let mut frame = vec![FAST_PATH_ENCRYPTED, 0x80];
+            let mut frame = vec![0x80, 0x80];
             // 2-byte length form regardless of size, as a server may send it
             let total = 3 + sealed.len();
             frame[1] = 0x80 | u8::try_from(total >> 8).unwrap();
@@ -768,14 +794,7 @@ mod tests {
         for count in 0..3 {
             let payload = vec![u8::try_from(count).unwrap(); 20];
             let sealed = server_seal(&mut server, &payload, Some(count));
-            let frame = [
-                vec![
-                    FAST_PATH_ENCRYPTED | FAST_PATH_SECURE_CHECKSUM,
-                    u8::try_from(2 + sealed.len()).unwrap(),
-                ],
-                sealed,
-            ]
-            .concat();
+            let frame = [vec![0xC0, u8::try_from(2 + sealed.len()).unwrap()], sealed].concat();
 
             assert_eq!(
                 codec.decrypt_inbound(&frame).unwrap(),
@@ -790,12 +809,12 @@ mod tests {
         let mut server = server_keys();
         for payload_len in [5usize, 0x75, 0x90] {
             let payload = vec![0x11; payload_len];
-            let built = build_fast_path(0x04, &payload);
+            let built = build_fast_path(0x04, &payload).unwrap();
 
             let out = codec.encrypt_outbound(&built).unwrap();
 
             let parsed = FastPath::parse(&out).unwrap();
-            assert_eq!(parsed.header, 0x04 | FAST_PATH_ENCRYPTED);
+            assert_eq!(parsed.header, 0x84);
             assert_eq!(server_open(&mut server, parsed.payload), payload);
         }
     }
@@ -804,7 +823,7 @@ mod tests {
     fn mac_mismatch_is_an_error() {
         let mut codec = client();
         let mut server = server_keys();
-        let mut frame = encrypted_indication(&mut server, IO, BasicSecurityHeaderFlags::empty(), &[1, 2, 3, 4]);
+        let mut frame = encrypted_indication(&mut server, IO, 0, &[1, 2, 3, 4]);
         let last = frame.len() - 1;
         frame[last] ^= 0x01;
 
@@ -836,7 +855,7 @@ mod tests {
         for channel in [IO, STATIC_CHANNEL] {
             let out = codec.encrypt_outbound(&request(channel, &[1, 2, 3])).unwrap();
             let user_data = user_data_of(&out);
-            assert_eq!(user_data[..4], header(BasicSecurityHeaderFlags::ENCRYPT));
+            assert_eq!(user_data[..4], raw_header(0x0008));
             assert_eq!(server_open(&mut server, &user_data[4..]), vec![1, 2, 3]);
         }
     }

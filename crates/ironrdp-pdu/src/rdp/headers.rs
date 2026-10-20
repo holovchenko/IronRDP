@@ -744,7 +744,8 @@ bitflags! {
         const IGNORE_SEQNO = 0x0020;
         const INFO_PKT = 0x0040;
         const LICENSE_PKT = 0x0080;
-        const LICENSE_ENCRYPT_CS = 0x0100;
+        // MS-RDPBCGR 2.2.8.1.1.2.1: SEC_LICENSE_ENCRYPT_CS shares its value with SEC_LICENSE_ENCRYPT_SC.
+        const LICENSE_ENCRYPT_CS = 0x0200;
         const LICENSE_ENCRYPT_SC = 0x0200;
         const REDIRECTION_PKT = 0x0400;
         const SECURE_CHECKSUM = 0x0800;
