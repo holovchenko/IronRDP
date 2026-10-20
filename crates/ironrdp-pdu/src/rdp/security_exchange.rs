@@ -2,7 +2,7 @@
 //!
 //! Defined in [\[MS-RDPBCGR\] 2.2.1.10].
 //!
-//! [\[MS-RDPBCGR\] 2.2.1.10]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/b9b0a1e4-4d03-4cb1-9dd7-1d2e1b1f1d2c
+//! [\[MS-RDPBCGR\] 2.2.1.10]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/9cde84cd-5055-475a-ac8b-704db419b66f
 
 use ironrdp_core::{
     Decode, DecodeResult, Encode, EncodeResult, ReadCursor, WriteCursor, cast_length, ensure_fixed_part_size,
@@ -15,7 +15,7 @@ use crate::rdp::headers::{BasicSecurityHeader, BasicSecurityHeaderFlags};
 ///
 /// Defined in [\[MS-RDPBCGR\] 2.2.1.10].
 ///
-/// [\[MS-RDPBCGR\] 2.2.1.10]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/b9b0a1e4-4d03-4cb1-9dd7-1d2e1b1f1d2c
+/// [\[MS-RDPBCGR\] 2.2.1.10]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/9cde84cd-5055-475a-ac8b-704db419b66f
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub struct SecurityExchangePdu {

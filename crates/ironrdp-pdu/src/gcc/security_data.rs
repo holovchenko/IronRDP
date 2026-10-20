@@ -35,6 +35,7 @@ impl ClientSecurityData {
         }
     }
 
+    /// Client security data requesting Standard RDP Security with RC4 (40-, 56- and 128-bit).
     pub fn rc4() -> Self {
         Self {
             encryption_methods: EncryptionMethod::BIT_40 | EncryptionMethod::BIT_56 | EncryptionMethod::BIT_128,
