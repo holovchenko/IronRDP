@@ -147,7 +147,17 @@ impl LegacySecurityCodec {
             self.phase = Phase::Active;
         }
 
-        if !encrypted && self.phase == Phase::Active && self.require_inbound_encryption {
+        // Above ENCRYPTION_LEVEL_LOW an ordinary data PDU must be encrypted: not on the message channel
+        // (Auto-Detect, Heartbeat and Multitransport requests carry a plain Basic Security Header) and not
+        // when the header carries flags beyond the crypto ones (e.g. SEC_REDIRECTION_PKT). This matches
+        // FreeRDP, whose client never enforces encryption. Standard RDP Security has no server
+        // authentication, so the guard only blocks naive injection of plaintext data.
+        if !encrypted
+            && self.phase == Phase::Active
+            && self.require_inbound_encryption
+            && Some(slow.channel_id) != self.message_channel_id
+            && remaining_flags(flags).is_empty()
+        {
             return Err(ConnectorError::reason(
                 "legacy security",
                 "unencrypted PDU received while encryption is required",
@@ -1065,5 +1075,46 @@ mod tests {
         let mut low = client_at(EncryptionLevel::Low);
         low.phase = Phase::Active;
         assert_eq!(low.decrypt_inbound(&frame).unwrap(), frame);
+    }
+
+    #[test]
+    fn unencrypted_message_channel_pdus_pass_at_high_in_active() {
+        for flags in [
+            BasicSecurityHeaderFlags::AUTODETECT_REQ,
+            BasicSecurityHeaderFlags::HEARTBEAT,
+        ] {
+            let mut codec = client_at(EncryptionLevel::High);
+            codec.phase = Phase::Active;
+            let frame = indication(MSG, &[header(flags), vec![7]].concat());
+
+            assert_eq!(
+                codec.decrypt_inbound(&frame).unwrap(),
+                indication(MSG, &[header(flags), vec![7]].concat())
+            );
+        }
+    }
+
+    #[test]
+    fn unencrypted_data_with_non_crypto_flags_passes_at_high_in_active() {
+        let mut codec = client_at(EncryptionLevel::High);
+        codec.phase = Phase::Active;
+        let frame = indication(
+            IO,
+            &[header(BasicSecurityHeaderFlags::REDIRECTION_PKT), vec![7]].concat(),
+        );
+
+        assert!(codec.decrypt_inbound(&frame).is_ok());
+    }
+
+    #[test]
+    fn unencrypted_static_channel_data_is_rejected_at_high_in_active() {
+        let mut codec = client_at(EncryptionLevel::High);
+        codec.phase = Phase::Active;
+
+        let err = codec
+            .decrypt_inbound(&indication(STATIC_CHANNEL, &[0, 0, 0, 0, 9]))
+            .unwrap_err();
+
+        assert!(format!("{err:?}").contains("unencrypted PDU received"), "{err:?}");
     }
 }
