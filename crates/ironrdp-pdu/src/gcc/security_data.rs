@@ -34,6 +34,13 @@ impl ClientSecurityData {
             ext_encryption_methods: 0,
         }
     }
+
+    pub fn rc4() -> Self {
+        Self {
+            encryption_methods: EncryptionMethod::BIT_40 | EncryptionMethod::BIT_56 | EncryptionMethod::BIT_128,
+            ext_encryption_methods: 0,
+        }
+    }
 }
 
 impl Encode for ClientSecurityData {
@@ -215,5 +222,19 @@ impl EncryptionLevel {
     )]
     fn as_u32(self) -> u32 {
         self as u32
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use ironrdp_core::encode_vec;
+
+    use super::*;
+
+    #[test]
+    fn client_security_data_rc4_encodes_methods() {
+        let encoded = encode_vec(&ClientSecurityData::rc4()).unwrap();
+
+        assert_eq!(encoded, [0x0B, 0, 0, 0, 0, 0, 0, 0]);
     }
 }

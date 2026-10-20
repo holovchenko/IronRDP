@@ -13,6 +13,7 @@ pub mod headers;
 pub mod heartbeat;
 pub mod multitransport;
 pub mod refresh_rectangle;
+pub mod security_exchange;
 pub mod server_error_info;
 pub mod server_license;
 pub mod session_info;
