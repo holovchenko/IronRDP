@@ -2873,6 +2873,55 @@ mod tests {
         }
 
         #[test]
+        fn gcc_certificate_reaches_license_exchange_with_empty_license_certificate() {
+            use ironrdp_pdu::rdp::headers::BasicSecurityHeader;
+            use ironrdp_pdu::rdp::server_license::{
+                LicenseHeader, LicensePdu, PreambleFlags, PreambleType, PreambleVersion, ProductInfo, Scope,
+                ServerLicenseRequest,
+            };
+
+            let mut connector = ClientConnector::new(super::minimal_config(), "127.0.0.1:3389".parse().unwrap());
+            connector.legacy_server_certificate = Some(decode::<ServerCertificate>(&server_cert()).unwrap());
+            connector.state = super::super::ClientConnectorState::ConnectTimeAutoDetection {
+                io_channel_id: IO_CHANNEL_ID,
+                user_channel_id: USER_CHANNEL_ID,
+            };
+            let mut output = WriteBuf::new();
+            connector.step(&[], None, &mut output).expect("advance to licensing");
+            assert_eq!(connector.state.name(), "LicensingExchange");
+
+            let mut request = ServerLicenseRequest {
+                license_header: LicenseHeader {
+                    security_header: BasicSecurityHeader {
+                        flags: BasicSecurityHeaderFlags::LICENSE_PKT,
+                    },
+                    preamble_message_type: PreambleType::LicenseRequest,
+                    preamble_flags: PreambleFlags::empty(),
+                    preamble_version: PreambleVersion::V3,
+                    preamble_message_size: 0,
+                },
+                server_random: vec![7; 32],
+                product_info: ProductInfo {
+                    version: 0x60000,
+                    company_name: "Microsoft Corporation".to_owned(),
+                    product_id: "A02".to_owned(),
+                },
+                server_certificate: None,
+                scope_list: vec![Scope("microsoft.com".to_owned())],
+            };
+            request.license_header.preamble_message_size = u16::try_from(request.size()).unwrap();
+            let user_data = encode_vec(&LicensePdu::from(request)).unwrap();
+            let input = super::encode_send_data_indication(USER_CHANNEL_ID, IO_CHANNEL_ID, &user_data);
+
+            let mut output = WriteBuf::new();
+            let written = connector
+                .step(&input, None, &mut output)
+                .expect("GCC certificate must let the license exchange proceed");
+
+            assert!(matches!(written, crate::Written::Size(_)));
+        }
+
+        #[test]
         fn proprietary_certificate_yields_the_big_endian_public_key() {
             let public_key = {
                 let cert = decode::<ServerCertificate>(&server_cert()).unwrap();

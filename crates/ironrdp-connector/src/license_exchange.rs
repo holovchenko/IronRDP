@@ -534,6 +534,10 @@ mod tests {
 
     /// A Server License Request PDU with `wBlobLen = 0` (no certificate).
     fn license_request_without_certificate(scope: &str) -> Vec<u8> {
+        license_request(scope, None)
+    }
+
+    fn license_request(scope: &str, server_certificate: Option<ServerCertificate>) -> Vec<u8> {
         let mut request = ServerLicenseRequest {
             license_header: LicenseHeader {
                 security_header: BasicSecurityHeader {
@@ -550,12 +554,78 @@ mod tests {
                 company_name: "Microsoft Corporation".to_owned(),
                 product_id: "A02".to_owned(),
             },
-            server_certificate: None,
+            server_certificate,
             scope_list: vec![Scope(scope.to_owned())],
         };
         request.license_header.preamble_message_size = u16::try_from(request.size()).unwrap();
         let user_data = encode_vec(&LicensePdu::from(request)).unwrap();
         encode_send_data_indication(1001, 1001, &user_data)
+    }
+
+    /// 1024-bit proprietary certificate: a different key size than `gcc_certificate`.
+    fn larger_certificate() -> ServerCertificate {
+        let mut modulus = vec![0xA5; 128];
+        modulus[0] = 0x01;
+        modulus.extend([0; 8]);
+        ServerCertificate {
+            issued_permanently: false,
+            certificate: CertificateType::Proprietary(ProprietaryCertificate {
+                public_key: RsaPublicKey {
+                    public_exponent: 65537,
+                    modulus,
+                },
+                signature: vec![0; 72],
+            }),
+        }
+    }
+
+    fn encrypted_premaster_len(output: &WriteBuf) -> usize {
+        let request =
+            ironrdp_core::decode::<ironrdp_pdu::x224::X224<ironrdp_pdu::mcs::SendDataRequest<'_>>>(output.filled())
+                .expect("output is a Send Data Request")
+                .0;
+        match ironrdp_core::decode::<LicensePdu>(&request.user_data).expect("output carries a licensing PDU") {
+            LicensePdu::ClientNewLicenseRequest(pdu) => pdu.encrypted_premaster_secret.len(),
+            other => panic!("expected ClientNewLicenseRequest, got {other:?}"),
+        }
+    }
+
+    // TESSERA PATCH — the certificate in the license request wins over the GCC fallback.
+    #[test]
+    fn license_request_certificate_takes_precedence_over_gcc_certificate() {
+        let mut output = WriteBuf::new();
+        let mut sequence =
+            LicenseExchangeSequence::new(1001, "tessera".to_owned(), None, [0; 4], Arc::new(NoopLicenseCache))
+                .with_server_certificate(gcc_certificate());
+        sequence
+            .step(
+                &license_request("microsoft.com", Some(larger_certificate())),
+                None,
+                &mut output,
+            )
+            .expect("request certificate is usable");
+        assert_eq!(
+            encrypted_premaster_len(&output),
+            136,
+            "must use the request's 1024-bit key"
+        );
+
+        let mut output = WriteBuf::new();
+        let mut sequence =
+            LicenseExchangeSequence::new(1001, "tessera".to_owned(), None, [0; 4], Arc::new(NoopLicenseCache))
+                .with_server_certificate(larger_certificate());
+        sequence
+            .step(
+                &license_request("microsoft.com", Some(gcc_certificate())),
+                None,
+                &mut output,
+            )
+            .expect("request certificate is usable");
+        assert_eq!(
+            encrypted_premaster_len(&output),
+            72,
+            "must use the request's 512-bit key"
+        );
     }
 
     // TESSERA PATCH — empty server certificate blob under Standard RDP Security.
