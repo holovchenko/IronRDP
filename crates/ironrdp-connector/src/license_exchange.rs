@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use ironrdp_core::WriteBuf;
 use ironrdp_pdu::PduHint;
-use ironrdp_pdu::rdp::server_license::{self, LicenseInformation, LicensePdu, ServerLicenseError};
+use ironrdp_pdu::rdp::server_license::{self, LicenseInformation, LicensePdu, ServerCertificate, ServerLicenseError};
 use rand::RngCore as _;
 use tracing::{debug, error, info, trace, warn};
 
@@ -125,6 +125,10 @@ pub struct LicenseExchangeSequence {
     pub domain: Option<String>,
     pub hardware_id: [u32; 4],
     pub license_cache: Arc<dyn LicenseCache>,
+    /// TESSERA PATCH — Server Certificate from GCC Server Security Data, used
+    /// when the Server License Request carries an empty certificate blob
+    /// (Standard RDP Security). See `with_server_certificate`.
+    pub server_certificate: Option<ServerCertificate>,
     /// TESSERA PATCH — count of non-licensing PDUs skipped over the whole
     /// license exchange; see `log_skipped_non_license_pdu`. A plain field
     /// rather than threaded through each `LicenseExchangeState` variant:
@@ -172,8 +176,22 @@ impl LicenseExchangeSequence {
             domain,
             hardware_id,
             license_cache,
+            server_certificate: None,
             skip_count: 0,
         }
+    }
+
+    /// TESSERA PATCH — see rdp/ironrdp-fork.md.
+    ///
+    /// Under Standard RDP Security the server may send the Server License
+    /// Request with `wBlobLen = 0` because the client already holds the server
+    /// certificate from GCC Server Security Data (MS-RDPELE 2.2.2.1). The
+    /// given certificate is the fallback for that case; a certificate inside
+    /// the license request still wins (FreeRDP `license_get_server_rsa_public_key`).
+    #[must_use]
+    pub fn with_server_certificate(mut self, server_certificate: ServerCertificate) -> Self {
+        self.server_certificate = Some(server_certificate);
+        self
     }
 }
 
@@ -222,7 +240,13 @@ impl Sequence for LicenseExchangeSequence {
                     .with_context("decode during LicenseExchangeState::NewLicenseRequest")?;
 
                 match license_pdu {
-                    LicensePdu::ServerLicenseRequest(license_request) => {
+                    LicensePdu::ServerLicenseRequest(mut license_request) => {
+                        // TESSERA PATCH — see rdp/ironrdp-fork.md. Empty certificate blob
+                        // (Standard RDP Security): use the GCC Server Security Data one.
+                        if license_request.server_certificate.is_none() {
+                            license_request.server_certificate = self.server_certificate.take();
+                        }
+
                         let mut rng = rand::rng();
                         let mut client_random = [0u8; server_license::RANDOM_NUMBER_SIZE];
                         rng.fill_bytes(&mut client_random);
@@ -475,7 +499,100 @@ impl Sequence for LicenseExchangeSequence {
 // TESSERA PATCH — tests for the skip-and-stay guard above (rdp/ironrdp-fork.md).
 #[cfg(test)]
 mod tests {
+    use ironrdp_core::encode_vec;
+    use ironrdp_pdu::rdp::headers::BasicSecurityHeader;
+    use ironrdp_pdu::rdp::headers::BasicSecurityHeaderFlags;
+    use ironrdp_pdu::rdp::server_license::cert::{CertificateType, ProprietaryCertificate, RsaPublicKey};
+    use ironrdp_pdu::rdp::server_license::{
+        LicenseHeader, PreambleFlags, PreambleType, PreambleVersion, ProductInfo, Scope, ServerLicenseRequest,
+    };
+
     use super::*;
+
+    /// MS-RDPBCGR 4.1.4 512-bit proprietary-certificate modulus (big-endian).
+    const SERVER_MODULUS_BE: [u8; 64] = [
+        0xbc, 0x12, 0x56, 0x26, 0x63, 0x88, 0x83, 0xd1, 0xf6, 0xc1, 0x1f, 0xa6, 0x55, 0x1f, 0xb1, 0xa0, 0x31, 0xfd,
+        0x01, 0xa2, 0xe5, 0x79, 0x68, 0xea, 0x75, 0x32, 0xff, 0xe8, 0xae, 0x55, 0x2d, 0x3c, 0xc8, 0x9b, 0xfb, 0xc4,
+        0x96, 0x02, 0x70, 0xf8, 0x3d, 0x0c, 0x5f, 0xf1, 0xcb, 0xa5, 0xf1, 0xd6, 0x94, 0x71, 0xf8, 0x87, 0x2e, 0x5f,
+        0xd5, 0x05, 0x55, 0xc3, 0x61, 0x6d, 0xba, 0xfe, 0x81, 0xcb,
+    ];
+
+    fn gcc_certificate() -> ServerCertificate {
+        let mut modulus: Vec<u8> = SERVER_MODULUS_BE.iter().rev().copied().collect();
+        modulus.extend([0; 8]);
+        ServerCertificate {
+            issued_permanently: false,
+            certificate: CertificateType::Proprietary(ProprietaryCertificate {
+                public_key: RsaPublicKey {
+                    public_exponent: 65537,
+                    modulus,
+                },
+                signature: vec![0; 72],
+            }),
+        }
+    }
+
+    /// A Server License Request PDU with `wBlobLen = 0` (no certificate).
+    fn license_request_without_certificate(scope: &str) -> Vec<u8> {
+        let mut request = ServerLicenseRequest {
+            license_header: LicenseHeader {
+                security_header: BasicSecurityHeader {
+                    flags: BasicSecurityHeaderFlags::LICENSE_PKT,
+                },
+                preamble_message_type: PreambleType::LicenseRequest,
+                preamble_flags: PreambleFlags::empty(),
+                preamble_version: PreambleVersion::V3,
+                preamble_message_size: 0,
+            },
+            server_random: vec![7; server_license::RANDOM_NUMBER_SIZE],
+            product_info: ProductInfo {
+                version: 0x60000,
+                company_name: "Microsoft Corporation".to_owned(),
+                product_id: "A02".to_owned(),
+            },
+            server_certificate: None,
+            scope_list: vec![Scope(scope.to_owned())],
+        };
+        request.license_header.preamble_message_size = u16::try_from(request.size()).unwrap();
+        let user_data = encode_vec(&LicensePdu::from(request)).unwrap();
+        encode_send_data_indication(1001, 1001, &user_data)
+    }
+
+    // TESSERA PATCH — empty server certificate blob under Standard RDP Security.
+    #[test]
+    fn empty_license_certificate_falls_back_to_gcc_certificate() {
+        let mut sequence =
+            LicenseExchangeSequence::new(1001, "tessera".to_owned(), None, [0; 4], Arc::new(NoopLicenseCache))
+                .with_server_certificate(gcc_certificate());
+        let mut output = WriteBuf::new();
+
+        let written = sequence
+            .step(&license_request_without_certificate("microsoft.com"), None, &mut output)
+            .expect("fallback certificate must let the exchange proceed");
+
+        assert!(matches!(written, Written::Size(_)));
+        assert!(
+            matches!(&sequence.state, LicenseExchangeState::PlatformChallenge { .. }),
+            "expected PlatformChallenge, got {:?}",
+            sequence.state
+        );
+    }
+
+    #[test]
+    fn empty_license_certificate_without_fallback_still_errors() {
+        let mut sequence =
+            LicenseExchangeSequence::new(1001, "tessera".to_owned(), None, [0; 4], Arc::new(NoopLicenseCache));
+        let mut output = WriteBuf::new();
+
+        let err = sequence
+            .step(&license_request_without_certificate("microsoft.com"), None, &mut output)
+            .expect_err("no certificate anywhere must fail");
+
+        assert!(
+            format!("{err:?}").contains("does not have a certificate"),
+            "unexpected error: {err:?}"
+        );
+    }
 
     /// The exact bytes captured from the incident (rdp/ironrdp-fork.md):
     /// `BasicSecurityHeader.flags = 0x1000` (SEC_AUTODETECT_REQ), not a

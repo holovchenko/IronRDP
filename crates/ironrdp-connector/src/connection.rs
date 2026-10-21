@@ -337,6 +337,9 @@ pub struct ClientConnector {
     pub message_channel_id: Option<u16>,
     /// What the Security Exchange needs from the server's GCC response, when it demands RC4.
     legacy_security_params: Option<LegacySecurityParams>,
+    /// TESSERA PATCH — GCC Server Security Data certificate, kept for the license exchange
+    /// (the server may omit its own copy under Standard RDP Security). See rdp/ironrdp-fork.md.
+    legacy_server_certificate: Option<ServerCertificate>,
     cluster_data: Option<gcc::ClientClusterData>,
     load_balance_info: Option<String>,
     /// X.224 negotiation flags supplied by the server.
@@ -376,6 +379,7 @@ struct LegacySecurityParams {
     level: gcc::EncryptionLevel,
     server_random: [u8; 32],
     public_key_der: Vec<u8>,
+    server_certificate: ServerCertificate,
 }
 
 impl ClientConnector {
@@ -387,6 +391,7 @@ impl ClientConnector {
             static_channels: StaticChannelSet::new(),
             message_channel_id: None,
             legacy_security_params: None,
+            legacy_server_certificate: None,
             cluster_data: None,
             load_balance_info: None,
             response_flags: nego::ResponseFlags::empty(),
@@ -524,6 +529,7 @@ impl ClientConnector {
             level: security.encryption_level,
             server_random,
             public_key_der: server_public_key(&certificate)?,
+            server_certificate: certificate,
         }))
     }
 
@@ -1434,6 +1440,7 @@ impl Sequence for ClientConnector {
                 rand::rng().fill_bytes(&mut client_random);
 
                 let encrypted_client_random = encrypt_client_random(&client_random, &params.public_key_der)?;
+                self.legacy_server_certificate = Some(params.server_certificate);
                 let keys = SessionKeys::derive(&client_random, &params.server_random, params.method)?;
                 handle.arm(LegacySecurityCodec::new(
                     keys,
@@ -1541,7 +1548,7 @@ impl Sequence for ClientConnector {
                         )
                     }
                 } else {
-                    let license_exchange = LicenseExchangeSequence::new(
+                    let mut license_exchange = LicenseExchangeSequence::new(
                         io_channel_id,
                         self.config.credentials.username().unwrap_or("").to_owned(),
                         self.config.domain.clone(),
@@ -1551,6 +1558,10 @@ impl Sequence for ClientConnector {
                             .clone()
                             .unwrap_or_else(|| Arc::new(NoopLicenseCache)),
                     );
+                    // TESSERA PATCH — see rdp/ironrdp-fork.md.
+                    if let Some(certificate) = self.legacy_server_certificate.take() {
+                        license_exchange = license_exchange.with_server_certificate(certificate);
+                    }
                     // If a PDU was read (message channel present) it is the first
                     // licensing PDU; advance the licensing sequence with it now,
                     // through the same helper the LicensingExchange state uses, so
@@ -2840,6 +2851,11 @@ mod tests {
 
             assert_eq!(connector.state.name(), "SecureSettingsExchange");
             assert!(handle.is_armed());
+            assert_eq!(
+                connector.legacy_server_certificate,
+                Some(decode::<ServerCertificate>(&server_cert()).unwrap()),
+                "GCC certificate is kept for the license exchange"
+            );
 
             let request = decode::<X224<mcs::SendDataRequest<'_>>>(output.filled()).unwrap().0;
             assert_eq!(request.initiator_id, USER_CHANNEL_ID);
